@@ -1911,6 +1911,469 @@ cmd_fw_confirm() {
     dim "снять: $PROG rollback"; say ""
 }
 
+# ═════════════════════ сетевой тюнинг и гигиена VPS ═════════════════════════
+# shellcheck shell=bash
+#
+#  Фрагмент для вставки в hubtune.sh. Не самостоятельный скрипт: рассчитан на
+#  общий контекст hubtune.sh (set -Eeuo pipefail, root, готовые helper'ы
+#  ok/warn/bad/info/dim/die/hdr/say/have/is_uint/confirm/fmt_mib/record/
+#  save_or_new/require_root и переменные $MARKER/$VERSION/$PROG/$BACKUP_DIR/
+#  $SYSCTL_FILE/$HOST_RAM_MIB/$HOST_VIRT).
+#
+#  Модуль 1 (build_sysctl_body_server) логично воткнуть сразу после
+#  build_sysctl_body() — она вызывается той же apply_sysctl() и пишется в тот
+#  же $SYSCTL_FILE, второй файл в /etc/sysctl.d не заводится.
+#
+#  Модуль 2 (hyg_render_plan/hyg_apply) самостоятельный: набор независимых
+#  пунктов гигиены VPS, каждый со своим тумблером HYG_DO_*. В --mode/--no-*
+#  основного скрипта пока не встроен — это отдельная зона ответственности,
+#  вызывающая сторона решает, откуда их дёргать (например, новая команда
+#  hygiene). Откат pkg/unit уже умеет rollback_from(), доделывать его не нужно.
+
+# ═════════════════ модуль 1: расширенный сетевой sysctl (сервер) ═══════════
+#
+# Второй файл в /etc/sysctl.d не заводим: два файла на одни и те же ключи
+# дерутся за порядок применения, а он зависит от имени файла и неочевиден на
+# глаз. build_sysctl_body_server() — НАДМНОЖЕСТВО обычного тела: дергает
+# build_sysctl_body() и дописывает поверх. Результат по-прежнему уходит в
+# один и тот же $SYSCTL_FILE через существующую apply_sysctl().
+
+SYSCTL_BUF_MIN_MIB=4                     # нижняя граница буфера сокета (совсем маленькие VPS)
+SYSCTL_BUF_MAX_MIB=64                    # верхняя граница — иначе буферы вытеснят из RAM сам Xray
+SYSCTL_BUF_MIB_PER_GIB=4                 # столько МиБ буфера добавляем на каждый ГиБ RAM хоста
+NETDEV_BUDGET=600                        # дефолтные 300 не успевают вычерпывать очередь при потоке мелких пакетов
+NETDEV_BUDGET_USECS=8000                 # дефолт ядра 2000 мкс расчитан на budget=300, при 600 его мало
+NF_CONNTRACK_MAX_SERVER=1048576          # заметно выше базовых 262144 из build_sysctl_body
+NF_CONNTRACK_TIMEOUT_ESTABLISHED=3600    # короче дефолта ядра 432000 (5 суток) — прокси плодит много сессий
+
+build_sysctl_body_server() {
+    local body extra ram_mib scaled_mib rmem_max wmem_max
+
+    body="$(build_sysctl_body)"
+
+    ram_mib="$HOST_RAM_MIB"
+    is_uint "$ram_mib" || ram_mib=0
+    [ "$ram_mib" -gt 0 ] || ram_mib=1024    # детект хоста не отработал — считаем от 1 ГиБ, не от нуля
+
+    scaled_mib=$(( ram_mib * SYSCTL_BUF_MIB_PER_GIB / 1024 ))
+    [ "$scaled_mib" -lt "$SYSCTL_BUF_MIN_MIB" ] && scaled_mib="$SYSCTL_BUF_MIN_MIB"
+    [ "$scaled_mib" -gt "$SYSCTL_BUF_MAX_MIB" ] && scaled_mib="$SYSCTL_BUF_MAX_MIB"
+    rmem_max=$(( scaled_mib * 1024 * 1024 ))
+    wmem_max=$(( rmem_max / 2 ))
+
+    extra="
+# ── build_sysctl_body_server: надмножество для выделенных/крупных нод ───────
+
+# буфер на сокет растёт вместе с RAM хоста (сейчас ${ram_mib} МиБ → ${scaled_mib} МиБ
+# на буфер чтения): на маленькой VPS большие буферы просто заберут память у
+# Xray, на большой — старые фиксированные значения станут тесными для long-fat
+# соединений
+net.core.rmem_max = $rmem_max
+net.core.wmem_max = $wmem_max
+net.core.rmem_default = 262144
+net.core.wmem_default = 262144
+net.ipv4.tcp_rmem = 4096 87380 $rmem_max
+net.ipv4.tcp_wmem = 4096 16384 $wmem_max
+net.ipv4.udp_rmem_min = 16384
+net.ipv4.udp_wmem_min = 16384
+
+# не будим процесс на каждый мелкий пакет, пока в очереди на отправку меньше
+# этого порога — меньше переключений контекста при большом числе сессий разом
+net.ipv4.tcp_notsent_lowat = 131072
+
+# NAPI/softirq: дефолтные 300 пакетов за проход не успевают вычерпываться,
+# когда через ноду идёт поток мелких TCP/UDP-пакетов множества сессий сразу
+net.core.netdev_budget = $NETDEV_BUDGET
+net.core.netdev_budget_usecs = $NETDEV_BUDGET_USECS
+
+# ── типовые пункты security-чеклистов (CIS/lynis) ───────────────────────────
+net.ipv4.tcp_syncookies = 1
+net.ipv4.conf.all.accept_redirects = 0
+net.ipv4.conf.default.accept_redirects = 0
+net.ipv4.conf.all.send_redirects = 0
+net.ipv4.conf.default.send_redirects = 0
+net.ipv4.conf.all.accept_source_route = 0
+net.ipv4.conf.default.accept_source_route = 0
+net.ipv4.conf.all.log_martians = 1
+net.ipv4.conf.default.log_martians = 1
+net.ipv4.icmp_echo_ignore_broadcasts = 1
+fs.protected_hardlinks = 1
+fs.protected_symlinks = 1
+kernel.dmesg_restrict = 1
+kernel.kptr_restrict = 1
+
+# rp_filter НЕ переводим в strict (1): нода проксирует/маршрутизирует чужой
+# трафик, и при асимметричной маршрутизации (ответ уходит не через тот же
+# интерфейс/путь, каким пришёл запрос) strict-режим молча дропает легитимные
+# пакеты. loose (2) всё ещё режет очевидный спуфинг, но не трогает асимметрию.
+net.ipv4.conf.all.rp_filter = 2
+net.ipv4.conf.default.rp_filter = 2"
+
+    if [ -e /proc/sys/net/netfilter/nf_conntrack_max ]; then
+        extra="$extra
+
+# conntrack трогаем, только если модуль реально загружен: на части урезанных
+# ядер (некоторые контейнерные виртуалки) его нет вовсе, а sysctl -p на
+# отсутствующий ключ просто шумит предупреждением внутри apply_sysctl()
+net.netfilter.nf_conntrack_max = $NF_CONNTRACK_MAX_SERVER
+net.netfilter.nf_conntrack_tcp_timeout_established = $NF_CONNTRACK_TIMEOUT_ESTABLISHED"
+    fi
+
+    printf '%s\n%s\n' "$body" "$extra"
+}
+
+# ══════════════════════ модуль 2: гигиена VPS ═══════════════════════════════
+#
+# Пять независимых пунктов, у каждого свой тумблер HYG_DO_* (по умолчанию
+# включены). Всё создаваемое проходит save_or_new() перед записью; пакеты и
+# юниты фиксируются через record pkg/record unit — ветку отката для них уже
+# знает rollback_from().
+
+HYG_DO_UNATTENDED=1        # unattended-upgrades: только security, без авторебута
+HYG_DO_JOURNALD=1          # journald: сохраняем логи между перезагрузками, с потолком
+HYG_DO_TIMESYNC=1          # systemd-timesyncd, если время не синхронизирует что-то ещё
+HYG_DO_THP=1               # transparent hugepages → madvise
+HYG_DO_GOVERNOR=1          # cpu governor → performance, если это вообще видно системе
+
+HYG_UNATTENDED_DROPIN="/etc/apt/apt.conf.d/52-hubtune-unattended"
+HYG_JOURNALD_DROPIN_DIR="/etc/systemd/journald.conf.d"
+HYG_JOURNALD_DROPIN="$HYG_JOURNALD_DROPIN_DIR/10-hubtune-journald.conf"
+HYG_JOURNALD_MAX_USE="512M"
+HYG_JOURNALD_MAX_FILE_SIZE="64M"
+HYG_THP_UNIT="hubtune-thp.service"
+HYG_THP_MODE="madvise"
+HYG_THP_PATH="/sys/kernel/mm/transparent_hugepage/enabled"
+HYG_GOVERNOR="performance"
+HYG_GOVERNOR_UNIT="hubtune-governor.service"
+
+# /sys/kernel/mm/* и /sys/devices/system/cpu/*/cpufreq не привязаны к cgroup
+# и не namespace'ятся: в контейнерных виртуалках с общим ядром (OpenVZ/LXC)
+# запись туда меняет настройку хоста и всех соседей разом, а не только этой
+# гостевой системы. На полноценных VM (kvm/qemu/xen/...) и на железе это её
+# собственное ядро — там трогать можно.
+hyg_is_shared_kernel_virt() {
+    case "$HOST_VIRT" in
+        openvz|lxc|lxc-libvirt|systemd-nspawn|docker|podman|wsl) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+hyg_cpufreq_present() {
+    local f
+    for f in /sys/devices/system/cpu/cpu[0-9]*/cpufreq/scaling_governor; do
+        [ -e "$f" ] && return 0
+    done
+    return 1
+}
+
+hyg_other_timesync_active() {
+    local svc
+    for svc in chrony chronyd ntp ntpd ntpsec openntpd; do
+        systemctl is-active --quiet "$svc" 2>/dev/null && return 0
+    done
+    return 1
+}
+
+# ── unattended-upgrades: только security, без автоперезагрузки ──────────────
+hyg_apply_unattended() {
+    [ "$HYG_DO_UNATTENDED" = "1" ] || { dim "unattended-upgrades: пропущено настройкой"; return 0; }
+    if ! have apt-get; then
+        dim "unattended-upgrades: нужен apt (Debian/Ubuntu) — на этой системе его нет"
+        return 0
+    fi
+
+    if ! dpkg -s unattended-upgrades >/dev/null 2>&1; then
+        if ! DEBIAN_FRONTEND=noninteractive apt-get install -y unattended-upgrades >/dev/null 2>&1; then
+            # свежий VPS часто отдаётся с пустым или просроченным кэшем индексов
+            apt-get update >/dev/null 2>&1 || true
+            if ! DEBIAN_FRONTEND=noninteractive apt-get install -y unattended-upgrades >/dev/null 2>&1; then
+                warn "unattended-upgrades не установился — пропускаю настройку"
+                return 0
+            fi
+        fi
+        record pkg "unattended-upgrades"
+    fi
+
+    save_or_new "$HYG_UNATTENDED_DROPIN"
+    local tmp; tmp="$(mktemp)"
+    {
+        # apt.conf понимает только "//"-комментарии; "#" зарезервирован под
+        # директивы #include/#clear — обычная решётка тут же ломает apt целиком
+        printf '// %s %s\n' "$MARKER" "$VERSION"
+        # 52 — специально позже штатного 50unattended-upgrades: #clear должен
+        # сначала увидеть уже загруженный вендорный Origins-Pattern, чтобы
+        # было что чистить, а не просто добавлять свои строки поверх пустоты
+        printf '#clear Unattended-Upgrade::Origins-Pattern;\n'
+        printf 'Unattended-Upgrade::Origins-Pattern {\n'
+        # ${distro_id}/${distro_codename} — не переменные apt, а плейсхолдеры,
+        # которые сама unattended-upgrades подставит по фактической ОС; Debian
+        # и Ubuntu матчат security-репозиторий по-разному (label vs archive),
+        # поэтому держим варианты под обе — на "чужой" ветке они просто ни на
+        # что не сматчатся
+        printf '    "origin=Debian,codename=${distro_codename},label=Debian-Security";\n'
+        printf '    "origin=Debian,codename=${distro_codename}-security,label=Debian-Security";\n'
+        printf '    "origin=Ubuntu,archive=${distro_codename}-security";\n'
+        printf '    "origin=Ubuntu,archive=${distro_codename}-security,label=Ubuntu";\n'
+        printf '};\n'
+        printf 'APT::Periodic::Update-Package-Lists "1";\n'
+        # без этой пары ключей пакет стоит установленным, но по факту не
+        # запускается ни по таймеру, ни по крону — типичная причина, почему
+        # "автообновления включены", а на деле не сработали ни разу
+        printf 'APT::Periodic::Unattended-Upgrade "1";\n'
+        # автоперезагрузка в 4 утра по умолчанию — это разрыв разом у всех
+        # клиентов VPN-ноды; обновление ядра/openssl и так требует отдельного
+        # контролируемого ребута руками
+        printf 'Unattended-Upgrade::Automatic-Reboot "false";\n'
+    } > "$tmp"
+    install -m 0644 "$tmp" "$HYG_UNATTENDED_DROPIN"
+    rm -f "$tmp"
+    ok "записан $HYG_UNATTENDED_DROPIN (только security, автоперезагрузка выключена)"
+}
+
+# ── journald: логи переживают перезагрузку, но не разрастаются ──────────────
+hyg_apply_journald() {
+    [ "$HYG_DO_JOURNALD" = "1" ] || { dim "journald: пропущено настройкой"; return 0; }
+
+    mkdir -p "$HYG_JOURNALD_DROPIN_DIR"
+    save_or_new "$HYG_JOURNALD_DROPIN"
+    local tmp; tmp="$(mktemp)"
+    {
+        printf '# %s %s\n' "$MARKER" "$VERSION"
+        printf '[Journal]\n'
+        # без persistent лог живёт в tmpfs и пропадает при перезагрузке — а
+        # именно после OOM-килла или краша ноды это первое, что нужно смотреть
+        printf 'Storage=persistent\n'
+        printf 'SystemMaxUse=%s\n' "$HYG_JOURNALD_MAX_USE"
+        printf 'SystemMaxFileSize=%s\n' "$HYG_JOURNALD_MAX_FILE_SIZE"
+    } > "$tmp"
+    install -m 0644 "$tmp" "$HYG_JOURNALD_DROPIN"
+    rm -f "$tmp"
+
+    # у systemd-journald нет ExecReload — штатный способ применить конфиг
+    # именно restart; сокет активируется systemd'ом, короткий рестарт запись
+    # не роняет
+    if systemctl restart systemd-journald >/dev/null 2>&1; then
+        ok "записан $HYG_JOURNALD_DROPIN, journald перезапущен"
+    else
+        warn "записан $HYG_JOURNALD_DROPIN, но перезапустить journald не удалось — применится после ребута"
+    fi
+}
+
+# ── синхронизация времени: включаем свою, только если нет чужой ─────────────
+hyg_apply_timesync() {
+    [ "$HYG_DO_TIMESYNC" = "1" ] || { dim "синхронизация времени: пропущено настройкой"; return 0; }
+
+    if hyg_other_timesync_active; then
+        dim "синхронизация времени уже обеспечена другой службой (chrony/ntpd) — не трогаю"
+        return 0
+    fi
+
+    # в манифест ничего не пишем: это включение штатного вендорного юнита, а
+    # не наш файл, и откатывать синхронизацию времени нельзя — без неё
+    # посыплется проверка TLS-сертификатов у всех клиентов ноды
+    if systemctl enable --now systemd-timesyncd >/dev/null 2>&1; then
+        ok "включена синхронизация времени: systemd-timesyncd"
+    else
+        warn "не удалось включить systemd-timesyncd"
+    fi
+}
+
+# ── Transparent Huge Pages → madvise (sysctl этим не управляет) ─────────────
+hyg_apply_thp() {
+    [ "$HYG_DO_THP" = "1" ] || { dim "THP: пропущено настройкой"; return 0; }
+    if hyg_is_shared_kernel_virt; then
+        dim "THP: ядро общее с другими гостями ($HOST_VIRT) — не трогаю"
+        return 0
+    fi
+    if [ ! -e "$HYG_THP_PATH" ]; then
+        dim "THP: $HYG_THP_PATH в системе нет — пропускаю"
+        return 0
+    fi
+
+    local unit="/etc/systemd/system/$HYG_THP_UNIT" tmp
+    save_or_new "$unit"
+    tmp="$(mktemp)"
+    {
+        printf '# %s %s\n' "$MARKER" "$VERSION"
+        printf '[Unit]\n'
+        printf 'Description=HUBTune: transparent hugepage = %s\n' "$HYG_THP_MODE"
+        printf 'DefaultDependencies=no\n'
+        printf 'After=sysinit.target\n'
+        printf 'Before=basic.target\n\n'
+        printf '[Service]\n'
+        printf 'Type=oneshot\n'
+        printf 'RemainAfterExit=yes\n'
+        # madvise, а не always/never: always провоцирует паузы на compaction
+        # под нагрузкой (что бьёт по латентности прокси-трафика), never просто
+        # выключает THP всем подряд; madvise даёт huge pages только тем, кто
+        # сам попросил через MADV_HUGEPAGE
+        printf "ExecStart=/bin/sh -c 'echo %s > %s'\n" "$HYG_THP_MODE" "$HYG_THP_PATH"
+        printf '\n[Install]\n'
+        printf 'WantedBy=basic.target\n'
+    } > "$tmp"
+    install -m 0644 "$tmp" "$unit"
+    rm -f "$tmp"
+
+    systemctl daemon-reload
+    if systemctl enable --now "$HYG_THP_UNIT" >/dev/null 2>&1; then
+        ok "THP → $HYG_THP_MODE (юнит $HYG_THP_UNIT)"
+    else
+        warn "юнит $HYG_THP_UNIT не запустился — проверь systemctl status $HYG_THP_UNIT"
+    fi
+    record unit "$HYG_THP_UNIT"
+}
+
+# ── CPU governor → performance, если система вообще это показывает ──────────
+hyg_apply_governor() {
+    [ "$HYG_DO_GOVERNOR" = "1" ] || { dim "governor: пропущено настройкой"; return 0; }
+    if hyg_is_shared_kernel_virt; then
+        dim "governor: ядро общее с другими гостями ($HOST_VIRT) — не трогаю"
+        return 0
+    fi
+    if ! hyg_cpufreq_present; then
+        # на подавляющем большинстве VPS (KVM без passthrough) хосту не видно
+        # реального железа CPU — путей cpufreq просто нет, это норма, не сбой
+        dim "governor: cpufreq не выведен в систему — пропускаю"
+        return 0
+    fi
+
+    if have cpupower && cpupower frequency-set -g "$HYG_GOVERNOR" >/dev/null 2>&1; then
+        ok "governor → $HYG_GOVERNOR прямо сейчас (cpupower)"
+    elif printf '%s' "$HYG_GOVERNOR" | tee /sys/devices/system/cpu/cpu[0-9]*/cpufreq/scaling_governor >/dev/null 2>&1; then
+        ok "governor → $HYG_GOVERNOR прямо сейчас (sysfs)"
+    else
+        warn "не получилось переключить governor прямо сейчас"
+    fi
+
+    # значение в sysfs слетает при каждой перезагрузке независимо от того,
+    # чем его выставляли; закрепляем отдельным юнитом, не полагаясь на то,
+    # есть ли в дистрибутиве штатный cpupower.service (в одних есть, в других
+    # нет, и его поведение по умолчанию не одинаковое)
+    local unit="/etc/systemd/system/$HYG_GOVERNOR_UNIT" tmp
+    save_or_new "$unit"
+    tmp="$(mktemp)"
+    {
+        printf '# %s %s\n' "$MARKER" "$VERSION"
+        printf '[Unit]\n'
+        printf 'Description=HUBTune: cpu governor = %s\n' "$HYG_GOVERNOR"
+        printf 'After=multi-user.target\n\n'
+        printf '[Service]\n'
+        printf 'Type=oneshot\n'
+        printf 'RemainAfterExit=yes\n'
+        printf "ExecStart=/bin/sh -c 'echo %s | tee /sys/devices/system/cpu/cpu[0-9]*/cpufreq/scaling_governor >/dev/null'\n" "$HYG_GOVERNOR"
+        printf '\n[Install]\n'
+        printf 'WantedBy=multi-user.target\n'
+    } > "$tmp"
+    install -m 0644 "$tmp" "$unit"
+    rm -f "$tmp"
+
+    systemctl daemon-reload
+    systemctl enable "$HYG_GOVERNOR_UNIT" >/dev/null 2>&1 \
+        || warn "не удалось включить $HYG_GOVERNOR_UNIT в автозагрузку"
+    record unit "$HYG_GOVERNOR_UNIT"
+    ok "записан юнит $HYG_GOVERNOR_UNIT (закрепляет governor после ребута)"
+}
+
+hyg_render_plan() {
+    hdr "Гигиена VPS"
+
+    if [ "$HYG_DO_UNATTENDED" = "1" ]; then
+        if have apt-get; then
+            ok "unattended-upgrades: только security, без автоперезагрузки"
+        else
+            dim "unattended-upgrades: нужен apt (Debian/Ubuntu) — пропускаю"
+        fi
+    else
+        dim "unattended-upgrades: выключено"
+    fi
+
+    if [ "$HYG_DO_JOURNALD" = "1" ]; then
+        ok "journald: Storage=persistent, лимит $HYG_JOURNALD_MAX_USE"
+    else
+        dim "journald: выключено"
+    fi
+
+    if [ "$HYG_DO_TIMESYNC" = "1" ]; then
+        if hyg_other_timesync_active; then
+            dim "синхронизация времени: уже обеспечена другой службой — не трогаю"
+        else
+            ok "синхронизация времени: включаю systemd-timesyncd"
+        fi
+    else
+        dim "синхронизация времени: выключено"
+    fi
+
+    if [ "$HYG_DO_THP" = "1" ]; then
+        if hyg_is_shared_kernel_virt; then
+            dim "THP: хост общий с другими гостями ($HOST_VIRT) — не трогаю"
+        elif [ ! -e "$HYG_THP_PATH" ]; then
+            dim "THP: в системе не поддерживается — пропускаю"
+        else
+            ok "THP → $HYG_THP_MODE"
+        fi
+    else
+        dim "THP: выключено"
+    fi
+
+    if [ "$HYG_DO_GOVERNOR" = "1" ]; then
+        if hyg_is_shared_kernel_virt; then
+            dim "governor: хост общий с другими гостями ($HOST_VIRT) — не трогаю"
+        elif ! hyg_cpufreq_present; then
+            dim "governor: cpufreq не выведен в систему — пропускаю"
+        else
+            ok "governor → $HYG_GOVERNOR"
+        fi
+    else
+        dim "governor: выключено"
+    fi
+    say ""
+}
+
+hyg_apply() {
+    hdr "Гигиена VPS"
+    hyg_apply_unattended
+    hyg_apply_journald
+    hyg_apply_timesync
+    hyg_apply_thp
+    hyg_apply_governor
+    say ""
+}
+
+cmd_hygiene() {
+    require_root
+    detect_host
+    TG_MODE="server"
+
+    # Серверный набор — надмножество узлового, и уходит в тот же файл.
+    # Два файла в /etc/sysctl.d с близкими именами дрались бы за одни ключи.
+    PLAN_SYSCTL_BODY="$(build_sysctl_body_server)"
+    PLAN_SYSCTL=1
+    if [ -f "$SYSCTL_FILE" ] && printf '%s\n' "$PLAN_SYSCTL_BODY" | cmp -s - "$SYSCTL_FILE"; then
+        PLAN_SYSCTL=0
+    fi
+
+    hdr "Сетевой тюнинг"
+    if [ "$PLAN_SYSCTL" = "1" ]; then
+        ok "параметры ядра → $SYSCTL_FILE"
+        dim "буферы посчитаны от $(fmt_mib "$HOST_RAM_MIB") RAM; rp_filter оставлен loose,"
+        dim "потому что strict молча роняет асимметричную маршрутизацию на ноде"
+    else
+        dim "параметры ядра уже выставлены как нужно"
+    fi
+    hyg_render_plan
+
+    confirm "Применить?" || { dim "Отменено."; say ""; return 0; }
+    backup_init
+    trap on_error ERR
+    APPLY_STARTED=1
+    apply_sysctl
+    hyg_apply
+    trap - ERR
+    APPLY_STARTED=0
+    say ""; ok "Готово."; dim "откат: $PROG rollback"; say ""
+    return 0
+}
+
 # ══════════════════════════ SSH и fail2ban ══════════════════════════════════
 # shellcheck shell=bash
 #
@@ -2409,8 +2872,9 @@ cmd_menu() {
     printf '                  %sподключения — правила снимаются сами.%s\n' "$CD" "$CN"
     printf '  %s4%s) SSH         защита входа и fail2ban. Отключать пароли откажется,\n' "$CW" "$CN"
     printf '                  %sпока не увидит другого способа войти.%s\n' "$CD" "$CN"
-    printf '  %s5%s) Посмотреть  подробный отчёт, ничего не менять.\n' "$CW" "$CN"
-    printf '  %s6%s) Откатить    вернуть то, что сделал прошлый запуск.\n' "$CW" "$CN"
+    printf '  %s5%s) Сеть        буферы, очереди, conntrack, автообновления, журнал.\n' "$CW" "$CN"
+    printf '  %s6%s) Посмотреть  подробный отчёт, ничего не менять.\n' "$CW" "$CN"
+    printf '  %s7%s) Откатить    вернуть то, что сделал прошлый запуск.\n' "$CW" "$CN"
     printf '  %s0%s) Выход
 ' "$CW" "$CN"
     printf '
@@ -2424,10 +2888,11 @@ cmd_menu() {
         2) MODE="full"; apply_mode; CMD="apply";    cmd_apply ;;
         3) CMD="firewall"; cmd_firewall ;;
         4) CMD="ssh";      cmd_ssh ;;
-        5) CMD="status";   cmd_status ;;
-        6) CMD="rollback"; cmd_rollback ;;
+        5) CMD="hygiene";  cmd_hygiene ;;
+        6) CMD="status";   cmd_status ;;
+        7) CMD="rollback"; cmd_rollback ;;
         0|"") dim "Выход."; say "" ;;
-        *) die "Не понял «$choice». Ожидались 0-6." ;;
+        *) die "Не понял «$choice». Ожидались 0-7." ;;
     esac
     return 0
 }
@@ -2521,6 +2986,7 @@ parse_args() {
             status|plan|apply|rollback|version|help|menu) [ -z "$CMD" ] && CMD="$1" ;;
             firewall|fw)    [ -z "$CMD" ] && CMD="firewall" ;;
             ssh|sshd)       [ -z "$CMD" ] && CMD="ssh" ;;
+            tune|hygiene)   [ -z "$CMD" ] && CMD="hygiene" ;;
             confirm)        FW_CONFIRM=1 ;;
             --allow-tcp)    [ $# -ge 2 ] || die "Опция --allow-tcp требует значение."; FW_ALLOW_TCP="$2"; shift ;;
             --allow-tcp=*)  FW_ALLOW_TCP="${1#*=}" ;;
@@ -2626,6 +3092,7 @@ main() {
     case "$CMD" in
         firewall) if [ "$FW_CONFIRM" = "1" ]; then cmd_fw_confirm; else cmd_firewall; fi ;;
         ssh)      cmd_ssh ;;
+        hygiene)  cmd_hygiene ;;
         menu)     cmd_menu ;;
         status)   cmd_status ;;
         plan)     cmd_plan ;;
