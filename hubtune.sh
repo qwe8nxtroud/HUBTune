@@ -1047,6 +1047,8 @@ backup_init() {
 #   savedfile — файл был, откат вернёт сохранённую копию
 #   copy      — копия только для справки, откат её НЕ восстанавливает
 #   sysctl    — файл с прежними значениями ядра, откат применит его обратно
+#   pkg       — установленные нами пакеты; откат делает purge, но никогда
+#               не трогает ядро, на котором система работает сейчас
 #   nfttable  — наша таблица nft; откат её удаляет, чужие не трогает
 #   unit      — созданный нами systemd-юнит; откат выключает и удаляет
 #   swapfile  — откат сделает swapoff (если это безопасно) и удалит файл
@@ -1489,7 +1491,8 @@ manifest_reversed() {
 }
 
 rollback_from() {
-    local dir="$1" kind path saved n=0 bad=0
+    local dir="$1" kind path saved n=0 bad=0 pk list running
+    running="$(uname -r)"
     [ -f "$dir/manifest.tsv" ] || { warn "Нет манифеста в $dir"; return 1; }
 
     # Идём в обратном порядке и НЕ падаем на первой ошибке: недоделанный откат
@@ -1528,6 +1531,32 @@ rollback_from() {
                     bad=$(( bad + 1 ))
                 fi
                 fstab_drop_marker "$path" ;;
+            pkg)
+                if have apt-get; then
+                    list=""
+                    while IFS= read -r pk; do
+                        [ -n "$pk" ] || continue
+                        # Ядро, на котором система работает прямо сейчас, сносить
+                        # нельзя: следующей перезагрузке будет нечем грузиться.
+                        case "$pk" in
+                            *"$running"*)
+                                warn "пропускаю $pk — на этом ядре система работает сейчас"
+                                dim  "  чтобы его удалить, сперва загрузись в другое"
+                                continue ;;
+                        esac
+                        list="$list $pk"
+                    done <<EOF
+$(printf '%s' "$path" | tr ' ' '\n')
+EOF
+                    if [ -n "$list" ]; then
+                        # shellcheck disable=SC2086
+                        if DEBIAN_FRONTEND=noninteractive apt-get purge -y $list >/dev/null 2>&1; then
+                            info "удалены пакеты:$list"; n=$(( n + 1 ))
+                        else
+                            warn "не удалось удалить:$list"; bad=$(( bad + 1 ))
+                        fi
+                    fi
+                fi ;;
             nfttable)
                 if have nft && nft list table inet "$path" >/dev/null 2>&1; then
                     if nft delete table inet "$path"; then
@@ -1882,6 +1911,450 @@ cmd_fw_confirm() {
     dim "снять: $PROG rollback"; say ""
 }
 
+# ══════════════════════════ SSH и fail2ban ══════════════════════════════════
+# shellcheck shell=bash
+#
+# Модуль SSH + fail2ban для hubtune.sh. Вставляется как есть, отдельно не
+# запускается. Использует готовые из основного скрипта: ok warn bad info dim
+# die hdr say have is_uint confirm record save_or_new require_root,
+# а также MARKER VERSION PROG BACKUP_DIR и fw_ssh_ports/fw_session_peer.
+#
+# Главное правило модуля: типовое ужесточение (запрет root и паролей) на
+# ноде без второго пользователя — это самозапирание. Поэтому вход всегда
+# проверяется ДО того, как что-то отключается, а не после.
+
+# ── SSH: параметры по умолчанию ──────────────────────────────────────────────
+SSH_DROPIN_DIR="/etc/ssh/sshd_config.d"
+SSH_DROPIN_FILE="$SSH_DROPIN_DIR/60-hubtune-ssh.conf"
+SSH_MAIN_CONFIG="/etc/ssh/sshd_config"
+SSH_UNIT="ssh"                    # имя юнита по умолчанию (Debian/Ubuntu)
+SSH_MAX_AUTH_TRIES=3
+SSH_LOGIN_GRACE_TIME=30
+SSH_CLIENT_ALIVE_INTERVAL=300
+SSH_CLIENT_ALIVE_COUNT_MAX=2
+
+# Заполняются ssh_detect()/ssh_can_lock_out(), см. интерфейс ниже.
+SSH_HAS_ESCAPE=0                  # 1 — есть подтверждённый способ войти без пароля root
+SSH_ESCAPE_WHO=""                 # человекочитаемое объяснение, для вывода
+SSH_ESCAPE_KIND="none"            # none | user | root — от кого именно выход
+SSH_ROOT_LOGIN="unknown"          # текущее PermitRootLogin (sshd -T)
+SSH_PASSWORD_AUTH="unknown"       # текущее PasswordAuthentication (sshd -T)
+
+# ── fail2ban: параметры по умолчанию ─────────────────────────────────────────
+F2B_JAIL_FILE="/etc/fail2ban/jail.d/hubtune.local"
+F2B_MAXRETRY=5
+F2B_FINDTIME="10m"
+F2B_BANTIME="1h"
+F2B_IGNOREIP_EXTRA=""             # доп. адреса в ignoreip через пробел (задел под флаг)
+
+# ═══════════════════════════════ SSH: разведка ══════════════════════════════
+
+# На Debian/Ubuntu юнит называется ssh.service, но на части пересборок и
+# других семейств остаётся классическое sshd.service — не гадаем по имени
+# дистрибутива, а спрашиваем сам systemd, что у него реально загружено.
+_ssh_unit_name() {
+    if systemctl cat ssh.service >/dev/null 2>&1; then
+        printf 'ssh'
+    elif systemctl cat sshd.service >/dev/null 2>&1; then
+        printf 'sshd'
+    else
+        printf '%s' "$SSH_UNIT"
+    fi
+}
+
+# sshd_config.d подхватывается, только если основной файл его подключает.
+# Раз штатный файл трогать нельзя, при отсутствии Include честно отказываемся,
+# а не тихо пишем дроп-ин, который никогда не прочитается.
+_ssh_dropin_supported() {
+    grep -qiE '^[[:space:]]*Include[[:space:]]+.*sshd_config\.d' "$SSH_MAIN_CONFIG" 2>/dev/null
+}
+
+# Строка вида "command=...,no-pty ssh-ed25519 AAAA..." — тип ключа может
+# стоять не в начале строки, поэтому ищем подстроку, а не якорим ^.
+_ssh_has_real_key() {
+    local f="$1"
+    [ -s "$f" ] || return 1
+    grep -vE '^[[:space:]]*(#|$)' "$f" 2>/dev/null \
+        | grep -qE 'ssh-(ed25519|rsa|dss)|ecdsa-sha2-|sk-(ssh-ed25519|ecdsa-sha2-)'
+}
+
+# sudo проверяем и по членству в группе, и по прямой записи в sudoers —
+# второе бывает у ролей, которым sudo выдан без отдельной группы.
+_ssh_user_has_sudo() {
+    local u="$1" grp
+    for grp in sudo wheel admin; do
+        getent group "$grp" 2>/dev/null \
+            | awk -F: -v u="$u" '{n=split($4,a,","); for (i=1;i<=n;i++) if (a[i]==u) f=1} END{exit !f}' \
+            && return 0
+    done
+    grep -RhsqE "^[[:space:]]*${u}[[:space:]]" /etc/sudoers /etc/sudoers.d/ 2>/dev/null && return 0
+    return 1
+}
+
+# root: домашний каталог берём из passwd, а не хардкодим /root — на части
+# образов он переопределён.
+_ssh_root_has_key() {
+    local home=""
+    home="$(getent passwd root 2>/dev/null | awk -F: '{print $6; exit}' || true)"
+    [ -n "$home" ] || home="/root"
+    _ssh_has_real_key "$home/.ssh/authorized_keys"
+}
+
+# Первый попавшийся не-root пользователь: оболочка не nologin/false,
+# настоящий ключ в authorized_keys и права sudo. Только локальные записи
+# (getent passwd, не LDAP/AD) — для одиночной VPN-ноды этого достаточно.
+_ssh_find_escape_user() {
+    local login uid home shell
+    while IFS=: read -r login _ uid _ _ home shell; do
+        [ "$uid" != "0" ] || continue
+        case "$shell" in */nologin|*/false|'') continue ;; esac
+        [ -d "$home" ] || continue
+        _ssh_has_real_key "$home/.ssh/authorized_keys" || continue
+        _ssh_user_has_sudo "$login" || continue
+        printf '%s\n' "$login"
+        return 0
+    done < <(getent passwd)
+    return 1
+}
+
+# Есть ли путь войти, если пароль root и/или root-логин отключить.
+# Возврат 0 значит "да, можем себя запереть" (выхода нет) — так короче
+# читаются вызовы вида `ssh_can_lock_out && warn ...`. Побочный эффект —
+# заполняет SSH_HAS_ESCAPE/SSH_ESCAPE_WHO/SSH_ESCAPE_KIND для остальных
+# функций модуля.
+ssh_can_lock_out() {
+    SSH_HAS_ESCAPE=0
+    SSH_ESCAPE_KIND="none"
+    SSH_ESCAPE_WHO="нет ни пользователя с ключом и sudo, ни ключа у root"
+
+    local u=""
+    u="$(_ssh_find_escape_user || true)"
+    if [ -n "$u" ]; then
+        SSH_HAS_ESCAPE=1
+        SSH_ESCAPE_KIND="user"
+        SSH_ESCAPE_WHO="пользователь «$u»: есть shell, ключ в authorized_keys и sudo"
+        return 1
+    fi
+
+    if _ssh_root_has_key; then
+        SSH_HAS_ESCAPE=1
+        SSH_ESCAPE_KIND="root"
+        SSH_ESCAPE_WHO="root по ключу — пароль root отключим, вход по ключу оставим разрешённым"
+        return 1
+    fi
+
+    return 0
+}
+
+# ssh_detect — только сбор состояния, ничего не печатает и не решает.
+ssh_detect() {
+    SSH_ROOT_LOGIN="$(sshd -T 2>/dev/null | awk '/^permitrootlogin /{print $2; exit}' || true)"
+    SSH_PASSWORD_AUTH="$(sshd -T 2>/dev/null | awk '/^passwordauthentication /{print $2; exit}' || true)"
+    [ -n "$SSH_ROOT_LOGIN" ] || SSH_ROOT_LOGIN="unknown"
+    [ -n "$SSH_PASSWORD_AUTH" ] || SSH_PASSWORD_AUTH="unknown"
+
+    ssh_can_lock_out || true
+    return 0
+}
+
+ssh_render_plan() {
+    local peer cip
+
+    ssh_detect
+    hdr "SSH"
+    info "сейчас: PermitRootLogin=$SSH_ROOT_LOGIN, PasswordAuthentication=$SSH_PASSWORD_AUTH"
+
+    peer="$(fw_session_peer)"
+    cip="${peer%% *}"
+    [ -n "$cip" ] && dim "  текущая сессия: $cip"
+
+    if _ssh_dropin_supported; then
+        dim "  $SSH_MAIN_CONFIG подключает $SSH_DROPIN_DIR — дроп-ин сработает"
+    else
+        bad "$SSH_MAIN_CONFIG не подключает $SSH_DROPIN_DIR (нет строки Include)"
+        dim "  без неё дроп-ин будет лежать мёртвым грузом, apply откажется работать"
+        dim "  почини вручную: Include $SSH_DROPIN_DIR/*.conf"
+    fi
+
+    say ""
+    if [ "$SSH_HAS_ESCAPE" = "1" ]; then
+        ok "запасной вход есть: $SSH_ESCAPE_WHO"
+        if [ "$SSH_ESCAPE_KIND" = "user" ]; then
+            ok "будет: PermitRootLogin no, PasswordAuthentication no"
+        else
+            ok "будет: PermitRootLogin prohibit-password, PasswordAuthentication no"
+        fi
+    else
+        bad "запасного входа нет — единственный путь внутрь сейчас: пароль root"
+        warn "PermitRootLogin и PasswordAuthentication НЕ трогаю — это и есть защита от самозапирания"
+        dim "  сначала одно из двух:"
+        dim "  · заведи пользователя, добавь его в sudo, положи его публичный ключ"
+        dim "    в ~/.ssh/authorized_keys — тогда разрешим полное отключение root"
+        dim "  · либо просто положи свой публичный ключ в /root/.ssh/authorized_keys —"
+        dim "    тогда отключим только пароль, вход по ключу для root останется"
+        if [ "$SSH_PASSWORD_AUTH" = "no" ] && { [ "$SSH_ROOT_LOGIN" = "no" ] || [ "$SSH_ROOT_LOGIN" = "prohibit-password" ]; }; then
+            bad "похоже, сервер и так уже заперт без нашего участия — если это не ты настраивал,"
+            dim "  проверь доступ прямо сейчас, пока сессия открыта"
+        fi
+    fi
+
+    ok "всегда: MaxAuthTries $SSH_MAX_AUTH_TRIES, LoginGraceTime $SSH_LOGIN_GRACE_TIME, PermitEmptyPasswords no"
+    ok "всегда: X11Forwarding no, ClientAliveInterval $SSH_CLIENT_ALIVE_INTERVAL, ClientAliveCountMax $SSH_CLIENT_ALIVE_COUNT_MAX, UseDNS no"
+
+    say ""
+    dim "правка только через $SSH_DROPIN_FILE, $SSH_MAIN_CONFIG не трогается"
+    dim "перед применением — sshd -t, применение — systemctl reload (не restart)"
+    say ""
+}
+
+# Сверяем не текст конфига, а то, что реально видит sshd: sshd -T учитывает
+# все Include и порядок first-match-wins сам, без наших догадок про то, чей
+# файл в sshd_config.d прочитается раньше.
+_ssh_verify_effective() {
+    local key="$1" want="$2" got=""
+    got="$(sshd -T 2>/dev/null | awk -v k="$key" '$1==k{print $2; exit}' || true)"
+    [ "$got" = "$want" ]
+}
+
+ssh_apply() {
+    local want_root="" want_pass="" tmp errfile unit
+
+    ssh_can_lock_out || true
+
+    if [ "$SSH_HAS_ESCAPE" = "1" ]; then
+        if [ "$SSH_ESCAPE_KIND" = "user" ]; then
+            want_root="no"
+        else
+            want_root="prohibit-password"
+        fi
+        want_pass="no"
+    else
+        warn "запасного входа нет — PermitRootLogin и PasswordAuthentication не трогаю"
+    fi
+
+    _ssh_dropin_supported \
+        || die "В $SSH_MAIN_CONFIG нет Include $SSH_DROPIN_DIR/*.conf — дроп-ин не подхватится.
+   Файл не трогаю (по правилам модуля), добавь строку Include туда вручную и повтори apply."
+
+    mkdir -p "$SSH_DROPIN_DIR"
+    sshd -T > "$BACKUP_DIR/sshd-effective-before.txt" 2>/dev/null || true
+
+    tmp="$(mktemp)"
+    {
+        printf '# %s %s\n' "$MARKER" "$VERSION"
+        printf '# Сгенерировано %s. %s не изменялся, правь только этот файл.\n' \
+            "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$SSH_MAIN_CONFIG"
+        [ -n "$want_root" ] && printf 'PermitRootLogin %s\n' "$want_root"
+        [ -n "$want_pass" ] && printf 'PasswordAuthentication %s\n' "$want_pass"
+        printf 'MaxAuthTries %s\n' "$SSH_MAX_AUTH_TRIES"
+        printf 'LoginGraceTime %s\n' "$SSH_LOGIN_GRACE_TIME"
+        printf 'PermitEmptyPasswords no\n'
+        printf 'X11Forwarding no\n'
+        printf 'ClientAliveInterval %s\n' "$SSH_CLIENT_ALIVE_INTERVAL"
+        printf 'ClientAliveCountMax %s\n' "$SSH_CLIENT_ALIVE_COUNT_MAX"
+        printf 'UseDNS no\n'
+    } > "$tmp"
+
+    save_or_new "$SSH_DROPIN_FILE"
+    install -m 0644 "$tmp" "$SSH_DROPIN_FILE"
+    rm -f "$tmp"
+
+    errfile="$(mktemp)"
+    if ! sshd -t 2>"$errfile"; then
+        sed 's/^/    /' "$errfile" >&2
+        rm -f "$errfile"
+        die "sshd -t отверг новый конфиг. $SSH_DROPIN_FILE записан, но не применён —
+   поправь его руками или сделай $PROG rollback."
+    fi
+    rm -f "$errfile"
+    ok "sshd -t принял конфигурацию"
+
+    if [ -n "$want_root" ] && ! _ssh_verify_effective permitrootlogin "$want_root"; then
+        die "PermitRootLogin по факту не стал «$want_root» — перебивает другой файл в
+   $SSH_DROPIN_DIR или сам $SSH_MAIN_CONFIG. Reload НЕ делаю, разбирайся руками."
+    fi
+    if [ -n "$want_pass" ] && ! _ssh_verify_effective passwordauthentication "$want_pass"; then
+        die "PasswordAuthentication по факту не стал «$want_pass» — перебито другим файлом.
+   Reload НЕ делаю, разбирайся руками."
+    fi
+
+    unit="$(_ssh_unit_name)"
+    errfile="$(mktemp)"
+    if ! systemctl reload "$unit" 2>"$errfile"; then
+        sed 's/^/    /' "$errfile" >&2
+        rm -f "$errfile"
+        die "systemctl reload $unit не прошёл — конфиг валиден, но служба его не приняла."
+    fi
+    rm -f "$errfile"
+    ok "применено через systemctl reload $unit — текущие сессии не разорваны"
+
+    say ""
+    hdr "не закрывай эту сессию"
+    dim "открой ВТОРОЕ подключение и проверь вход им же способом, каким входишь обычно"
+    say ""
+    ok "если новое подключение работает — всё в порядке, эту сессию можно закрывать"
+    warn "если не работает — из ЭТОЙ, ещё открытой сессии:"
+    dim "    rm -f $SSH_DROPIN_FILE && sshd -t && systemctl reload $unit"
+    dim "  или: $PROG rollback"
+    say ""
+}
+
+# ═══════════════════════════════ fail2ban ═══════════════════════════════════
+
+# Автоопределение backend'а у fail2ban не заслуживает доверия, если на
+# машине есть и nftables, и iptables разом — берём nftables явно и сами.
+_f2b_backend() {
+    if have nft; then
+        printf 'nftables[type=multiport]'
+    elif have iptables; then
+        printf 'iptables-multiport'
+    else
+        printf ''
+    fi
+}
+
+f2b_render_plan() {
+    local ports peer cip backend
+
+    hdr "fail2ban"
+
+    if have fail2ban-client; then
+        ok "fail2ban уже установлен"
+    else
+        info "будет поставлен пакет fail2ban"
+    fi
+
+    backend="$(_f2b_backend)"
+    case "$backend" in
+        nftables*) ok "banaction: $backend — задаю явно, не отдаю на автоопределение" ;;
+        iptables*) warn "nft не найден, banaction будет: $backend" ;;
+        *)         bad "нет ни nft, ни iptables — банить будет нечем" ;;
+    esac
+
+    ports="$(fw_ssh_ports | tr '\n' ',')"
+    ports="${ports%,}"
+    [ -n "$ports" ] || ports=22
+    ok "джейл sshd на реальных портах sshd: $ports (не жёстко 22)"
+
+    peer="$(fw_session_peer)"
+    cip="${peer%% *}"
+    if [ -n "$cip" ]; then
+        ok "ignoreip получит адрес текущей сессии: $cip"
+    else
+        bad "IP текущей сессии не определяется — в ignoreip попадёт только 127.0.0.1/8 ::1"
+        dim "  впиши свой адрес в $F2B_JAIL_FILE вручную после apply"
+    fi
+    case "$cip" in
+        *:*) warn "сессия по IPv6 — из коробки fail2ban с ним дружит не всегда"
+             dim "  проверь allowipv6 в /etc/fail2ban/fail2ban.conf" ;;
+    esac
+
+    say ""
+    dim "пишу только $F2B_JAIL_FILE, jail.conf и jail.local не трогаю"
+    say ""
+}
+
+f2b_apply() {
+    local ports backend peer cip tmp errfile ignoreip
+
+    backend="$(_f2b_backend)"
+    [ -n "$backend" ] \
+        || die "нет ни nft, ни iptables — fail2ban банить не сможет, поставь один из них."
+
+    if ! have fail2ban-client; then
+        DEBIAN_FRONTEND=noninteractive apt-get install -y fail2ban >/dev/null \
+            || die "не удалось установить пакет fail2ban"
+        record pkg "fail2ban"
+        ok "пакет fail2ban установлен"
+    fi
+
+    ports="$(fw_ssh_ports | tr '\n' ',')"
+    ports="${ports%,}"
+    [ -n "$ports" ] || ports=22
+
+    peer="$(fw_session_peer)"
+    cip="${peer%% *}"
+    ignoreip="127.0.0.1/8 ::1"
+    [ -n "$cip" ] && ignoreip="$ignoreip $cip"
+    [ -n "$F2B_IGNOREIP_EXTRA" ] && ignoreip="$ignoreip $F2B_IGNOREIP_EXTRA"
+
+    mkdir -p /etc/fail2ban/jail.d
+    fail2ban-client -d > "$BACKUP_DIR/fail2ban-before.txt" 2>/dev/null || true
+
+    tmp="$(mktemp)"
+    {
+        printf '# %s %s\n' "$MARKER" "$VERSION"
+        printf '# Сгенерировано %s. jail.conf и jail.local не изменялись.\n' \
+            "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+        printf '\n[DEFAULT]\n'
+        printf 'banaction = %s\n' "$backend"
+        printf 'ignoreip = %s\n' "$ignoreip"
+        printf '\n[sshd]\n'
+        printf 'enabled = true\n'
+        printf 'port = %s\n' "$ports"
+        printf 'maxretry = %s\n' "$F2B_MAXRETRY"
+        printf 'findtime = %s\n' "$F2B_FINDTIME"
+        printf 'bantime = %s\n' "$F2B_BANTIME"
+    } > "$tmp"
+
+    # Не свой юнит, а системный демон пакета — при откате его нельзя
+    # "снимать" как unit (это выключило бы и удалило чужой сервис), поэтому
+    # в манифест идёт только сам файл джейла и, если ставили, пакет.
+    save_or_new "$F2B_JAIL_FILE"
+    install -m 0644 "$tmp" "$F2B_JAIL_FILE"
+    rm -f "$tmp"
+
+    errfile="$(mktemp)"
+    if ! fail2ban-client -d >"$errfile" 2>&1; then
+        sed 's/^/    /' "$errfile" >&2
+        rm -f "$errfile"
+        die "fail2ban не принял $F2B_JAIL_FILE — правь руками или сделай $PROG rollback."
+    fi
+    rm -f "$errfile"
+    ok "конфигурация fail2ban проверена (fail2ban-client -d)"
+
+    systemctl enable fail2ban >/dev/null 2>&1 || true
+    errfile="$(mktemp)"
+    if ! systemctl restart fail2ban 2>"$errfile"; then
+        sed 's/^/    /' "$errfile" >&2
+        rm -f "$errfile"
+        die "systemctl restart fail2ban не прошёл — конфиг проверен, но служба не поднялась."
+    fi
+    rm -f "$errfile"
+    ok "fail2ban перезапущен, джейл sshd активен на портах: $ports"
+
+    if [ -z "$cip" ]; then
+        warn "IP текущей сессии не определён — если fail2ban всё же забанит тебя самого:"
+        dim "    fail2ban-client set sshd unbanip <твой IP>"
+    fi
+    case "$cip" in
+        *:*) warn "сессия была по IPv6 — если словишь бан несмотря на ignoreip, проверь allowipv6" ;;
+    esac
+}
+
+cmd_ssh() {
+    require_root
+    detect_host
+    TG_MODE="server"
+    ssh_detect
+    ssh_render_plan
+    confirm "Применить настройки SSH?" || { dim "Отменено."; say ""; return 0; }
+    backup_init
+    trap on_error ERR
+    APPLY_STARTED=1
+    ssh_apply
+    say ""
+    f2b_render_plan
+    if confirm "Поставить fail2ban для SSH?"; then
+        f2b_apply
+    else
+        dim "fail2ban пропущен."
+    fi
+    trap - ERR
+    APPLY_STARTED=0
+    return 0
+}
+
 # ═══════════════════════════════════ меню ═══════════════════════════════════
 
 # Запуск без аргументов в терминале: короткая сводка и четыре пункта.
@@ -1934,8 +2407,10 @@ cmd_menu() {
 ' "$CD" "$CN"
     printf '  %s3%s) Файрвол     nftables с автооткатом: не подтвердил из нового\n' "$CW" "$CN"
     printf '                  %sподключения — правила снимаются сами.%s\n' "$CD" "$CN"
-    printf '  %s4%s) Посмотреть  подробный отчёт, ничего не менять.\n' "$CW" "$CN"
-    printf '  %s5%s) Откатить    вернуть то, что сделал прошлый запуск.\n' "$CW" "$CN"
+    printf '  %s4%s) SSH         защита входа и fail2ban. Отключать пароли откажется,\n' "$CW" "$CN"
+    printf '                  %sпока не увидит другого способа войти.%s\n' "$CD" "$CN"
+    printf '  %s5%s) Посмотреть  подробный отчёт, ничего не менять.\n' "$CW" "$CN"
+    printf '  %s6%s) Откатить    вернуть то, что сделал прошлый запуск.\n' "$CW" "$CN"
     printf '  %s0%s) Выход
 ' "$CW" "$CN"
     printf '
@@ -1948,10 +2423,11 @@ cmd_menu() {
         1) MODE="safe"; apply_mode; CMD="apply";    cmd_apply ;;
         2) MODE="full"; apply_mode; CMD="apply";    cmd_apply ;;
         3) CMD="firewall"; cmd_firewall ;;
-        4) CMD="status";   cmd_status ;;
-        5) CMD="rollback"; cmd_rollback ;;
+        4) CMD="ssh";      cmd_ssh ;;
+        5) CMD="status";   cmd_status ;;
+        6) CMD="rollback"; cmd_rollback ;;
         0|"") dim "Выход."; say "" ;;
-        *) die "Не понял «$choice». Ожидались 0-5." ;;
+        *) die "Не понял «$choice». Ожидались 0-6." ;;
     esac
     return 0
 }
@@ -2044,6 +2520,7 @@ parse_args() {
         case "$1" in
             status|plan|apply|rollback|version|help|menu) [ -z "$CMD" ] && CMD="$1" ;;
             firewall|fw)    [ -z "$CMD" ] && CMD="firewall" ;;
+            ssh|sshd)       [ -z "$CMD" ] && CMD="ssh" ;;
             confirm)        FW_CONFIRM=1 ;;
             --allow-tcp)    [ $# -ge 2 ] || die "Опция --allow-tcp требует значение."; FW_ALLOW_TCP="$2"; shift ;;
             --allow-tcp=*)  FW_ALLOW_TCP="${1#*=}" ;;
@@ -2148,6 +2625,7 @@ main() {
 
     case "$CMD" in
         firewall) if [ "$FW_CONFIRM" = "1" ]; then cmd_fw_confirm; else cmd_firewall; fi ;;
+        ssh)      cmd_ssh ;;
         menu)     cmd_menu ;;
         status)   cmd_status ;;
         plan)     cmd_plan ;;
