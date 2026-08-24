@@ -26,6 +26,13 @@ LIMITS_FILE="/etc/security/limits.d/99-hubtune.conf"
 SWAPFILE="/swapfile-hubtune"
 FSTAB_FILE="/etc/fstab"
 LOGROTATE_FILE="/etc/logrotate.d/hubtune"
+STATE_DIR="/var/lib/hubtune"
+FW_DIR="/etc/hubtune"
+FW_FILE="/etc/hubtune/firewall.nft"
+FW_UNIT="hubtune-firewall.service"
+FW_REVERT="hubtune-fw-revert"
+FW_TABLE="hubtune"
+FW_PENDING="/var/lib/hubtune/firewall-pending"
 DROPIN_NAME="10-hubtune.conf"
 
 # ── настройки по умолчанию (переопределяются флагами) ────────────────────────
@@ -34,6 +41,11 @@ RESERVE_MIN_MIB=192       # но не меньше этого
 RESERVE_MAX_MIB=1024      # и не больше этого
 LIMIT_FLOOR_MIB=256       # ниже такого лимита Xray просто не живёт
 SWAP_TRIGGER_MIB=2048     # при RAM <= этого предлагаем swap
+FW_GRACE=300              # секунд до автоотката правил, если не подтвердить
+FW_ALLOW_TCP=""           # дополнительные tcp-порты, через запятую
+FW_ALLOW_UDP=""           # то же для udp
+FW_NODE_PORT=""           # порт связи ноды с панелью (читается из .env)
+FW_PANEL_IP=""            # с какого адреса пускать на NODE_PORT
 SWAP_MAX_MIB=2048         # максимальный размер создаваемого swap
 LOG_MAX_SIZE="10m"
 LOG_MAX_FILE="3"
@@ -64,6 +76,7 @@ EX_SWAP=""; EX_SYSCTL=""; EX_BBR=""
 BACKUP_DIR=""
 MANIFEST=""
 ARGC=0
+FW_CONFIRM=0
 
 # ═════════════════════════════════ утилиты ══════════════════════════════════
 
@@ -1034,6 +1047,8 @@ backup_init() {
 #   savedfile — файл был, откат вернёт сохранённую копию
 #   copy      — копия только для справки, откат её НЕ восстанавливает
 #   sysctl    — файл с прежними значениями ядра, откат применит его обратно
+#   nfttable  — наша таблица nft; откат её удаляет, чужие не трогает
+#   unit      — созданный нами systemd-юнит; откат выключает и удаляет
 #   swapfile  — откат сделает swapoff (если это безопасно) и удалит файл
 #   fstab     — служебная отметка, чинится записью savedfile для /etc/fstab
 record() {
@@ -1513,6 +1528,19 @@ rollback_from() {
                     bad=$(( bad + 1 ))
                 fi
                 fstab_drop_marker "$path" ;;
+            nfttable)
+                if have nft && nft list table inet "$path" >/dev/null 2>&1; then
+                    if nft delete table inet "$path"; then
+                        info "снята таблица nft inet $path"; n=$(( n + 1 ))
+                    else warn "не снялась таблица nft inet $path"; bad=$(( bad + 1 )); fi
+                fi ;;
+            unit)
+                if have systemctl; then
+                    systemctl disable --now "$path" >/dev/null 2>&1 || true
+                    rm -f "/etc/systemd/system/$path" || true
+                    systemctl daemon-reload >/dev/null 2>&1 || true
+                    info "снят юнит $path"; n=$(( n + 1 ))
+                fi ;;
             fstab)
                 : ;;   # снимается в ветке swapfile через fstab_drop_marker
         esac
@@ -1546,6 +1574,312 @@ cmd_rollback() {
         say ""; warn "Откат завершён с замечаниями — смотри строки выше."; say ""
         return 1
     fi
+}
+
+# ══════════════════════════════ файрвол ═════════════════════════════════════
+#
+# Три вещи, из-за которых теряют доступ к серверу, и что с ними здесь сделано:
+#
+#  1. Правила применили и проверили в той же SSH-сессии. Она живёт за счёт
+#     `ct state established` и продолжает работать, даже если новые подключения
+#     уже дропаются. Поэтому подтверждение принимается ТОЛЬКО из нового
+#     соединения — сверяем клиентский порт с записанным при применении.
+#  2. Не было плана Б. Здесь до применения правил ставится systemd-таймер,
+#     который снесёт нашу таблицу через FW_GRACE секунд. Не подтвердил —
+#     доступ вернулся сам. Если таймер зарегистрировать не удалось, правила
+#     не применяются вообще.
+#  3. Смешали backend. ufw пишет через iptables-совместимость, firewalld — свой
+#     менеджер; поверх них наши nft-правила дают «правило есть, а трафик идёт
+#     не туда». При активном ufw/firewalld отказываемся работать.
+#
+# Работаем только в своей таблице `inet hubtune` и не трогаем чужие: у Docker
+# свои цепочки, и flush ruleset посреди рабочего дня оторвал бы контейнерам сеть.
+
+fw_available() { have nft; }
+
+fw_conflicting_manager() {
+    if systemctl is-active --quiet ufw 2>/dev/null; then printf 'ufw'; return 0; fi
+    if systemctl is-active --quiet firewalld 2>/dev/null; then printf 'firewalld'; return 0; fi
+    printf ''
+}
+
+# Реальные порты sshd: sshd -T учитывает Include и все директивы Port.
+fw_ssh_ports() {
+    local out=""
+    out="$(sshd -T 2>/dev/null | awk '/^port /{print $2}' || true)"
+    if [ -z "$out" ]; then
+        out="$(ss -tlnpH 2>/dev/null | awk '/sshd/{n=split($4,a,":"); print a[n]}' || true)"
+    fi
+    [ -z "$out" ] && out="22"
+    printf '%s\n' "$out" | sort -un
+}
+
+# Адрес и порт того пира, которого реально видит файрвол.
+fw_session_peer() {   # печатает: <ip клиента> <порт клиента> <порт сервера>
+    local cip="" cport="" srv="" sport=""
+    if [ -n "${SSH_CONNECTION:-}" ]; then
+        read -r cip cport srv sport <<EOF
+${SSH_CONNECTION}
+EOF
+    else
+        read -r cip cport <<EOF
+$(ss -tnpH state established 2>/dev/null | awk '/sshd/{peer=$5; port=peer; sub(/.*:/,"",port); addr=peer; sub(/:[^:]*$/,"",addr); print addr" "port; exit}' || true)
+EOF
+    fi
+    printf '%s %s %s\n' "${cip:-}" "${cport:-}" "${sport:-}"
+    return 0
+}
+
+fw_listening_tcp() {
+    ss -tlnH 2>/dev/null | awk '{n=split($4,a,":"); print a[n]}' | sort -un || true
+}
+fw_listening_udp() {
+    ss -ulnH 2>/dev/null | awk '{n=split($4,a,":"); print a[n]}' | sort -un || true
+}
+
+fw_node_port() {
+    local f
+    for f in /opt/remnanode/.env /opt/remnawave/node/.env; do
+        [ -r "$f" ] || continue
+        awk -F= '/^[[:space:]]*(NODE_PORT|APP_PORT)[[:space:]]*=/{gsub(/[^0-9]/,"",$2); if($2!="") print $2; exit}' "$f"
+        return 0
+    done
+    printf ''
+}
+
+# Собираем правила. Идиома `table; delete table; table {...}` — атомарная
+# замена одной таблицы: create-if-absent, снести, положить новую.
+fw_build_ruleset() {   # $1 — файл назначения
+    local out="$1" p ssh_ports tcp udp
+    ssh_ports="$(fw_ssh_ports)"
+    {
+        printf '#!/usr/sbin/nft -f\n'
+        printf '# %s %s\n' "$MARKER" "$VERSION"
+        printf '# Только своя таблица. Чужие (в том числе Docker) не трогаем.\n'
+        printf 'table inet %s\n' "$FW_TABLE"
+        printf 'delete table inet %s\n\n' "$FW_TABLE"
+        printf 'table inet %s {\n' "$FW_TABLE"
+        printf '  chain input {\n'
+        printf '    type filter hook input priority 0; policy drop;\n\n'
+        printf '    ct state established,related accept\n'
+        printf '    ct state invalid drop\n'
+        printf '    iif lo accept\n\n'
+        printf '    # без icmp сеть ведёт себя необъяснимо: ломается path MTU discovery\n'
+        printf '    ip protocol icmp icmp type { echo-request, destination-unreachable, time-exceeded, parameter-problem } accept\n'
+        printf '    ip6 nexthdr icmpv6 accept\n\n'
+        printf '    # SSH: все порты, на которых слушает sshd\n'
+        while IFS= read -r p; do
+            [ -n "$p" ] && printf '    tcp dport %s accept\n' "$p"
+        done <<EOFP
+$ssh_ports
+EOFP
+        if [ -n "$FW_ALLOW_TCP" ]; then
+            printf '\n    # порты сервиса\n'
+            while IFS= read -r p; do
+                [ -n "$p" ] && printf '    tcp dport %s accept\n' "$p"
+            done <<EOFT
+$(printf '%s' "$FW_ALLOW_TCP" | tr ', ' '\n\n')
+EOFT
+        fi
+        if [ -n "$FW_ALLOW_UDP" ]; then
+            while IFS= read -r p; do
+                [ -n "$p" ] && printf '    udp dport %s accept\n' "$p"
+            done <<EOFU
+$(printf '%s' "$FW_ALLOW_UDP" | tr ', ' '\n\n')
+EOFU
+        fi
+        if [ -n "$FW_NODE_PORT" ]; then
+            printf '\n    # порт связи с панелью — только с её адреса\n'
+            if [ -n "$FW_PANEL_IP" ]; then
+                printf '    ip saddr %s tcp dport %s accept\n' "$FW_PANEL_IP" "$FW_NODE_PORT"
+            else
+                printf '    tcp dport %s accept\n' "$FW_NODE_PORT"
+            fi
+        fi
+        printf '  }\n'
+        printf '  # output и forward не описываем: Reality и VLESS ходят наружу сами,\n'
+        printf '  # а закрытый output ломает VPN тихо, в отличие от закрытого input.\n'
+        printf '}\n'
+    } > "$out"
+}
+fw_guard() {
+    fw_available || die "nft не установлен. apt install nftables"
+    have systemd-run || die "нет systemd-run — без него не поставить страховочный таймер,
+   а применять правила файрвола на удалённой машине без страховки нельзя."
+    local m; m="$(fw_conflicting_manager)"
+    if [ -n "$m" ]; then
+        die "На сервере активен $m, а он держит правила через свой backend.
+   Наши nft-правила поверх него дадут «правило есть, а трафик идёт мимо».
+   Выключи его (systemctl disable --now $m) либо настраивай файрвол только им."
+    fi
+    return 0
+}
+
+fw_render_plan() {
+    local p peer
+    [ -n "$FW_NODE_PORT" ] || FW_NODE_PORT="$(fw_node_port)"
+
+    hdr "Файрвол"
+    info "таблица inet $FW_TABLE, политика input drop; output и forward не трогаем"
+    say ""
+    ok "SSH — все порты, на которых реально слушает sshd:"
+    while IFS= read -r p; do
+        [ -n "$p" ] && dim "  tcp/$p"
+    done <<EOF
+$(fw_ssh_ports)
+EOF
+    peer="$(fw_session_peer)"
+    [ -n "${peer%% *}" ] && dim "  текущая сессия с ${peer%% *} — именно этот адрес видит файрвол"
+
+    if [ -n "$FW_NODE_PORT" ]; then
+        if [ -n "$FW_PANEL_IP" ]; then
+            ok "порт связи с панелью tcp/$FW_NODE_PORT — только с $FW_PANEL_IP"
+        else
+            ok "порт связи с панелью tcp/$FW_NODE_PORT — со всех адресов"
+            dim "  документация Remnawave советует пускать только с IP панели: --panel-ip A.B.C.D"
+        fi
+    fi
+    [ -n "$FW_ALLOW_TCP" ] && ok "дополнительно tcp: $FW_ALLOW_TCP"
+    [ -n "$FW_ALLOW_UDP" ] && ok "дополнительно udp: $FW_ALLOW_UDP"
+
+    say ""
+    warn "Порты инбаундов Xray задаются в панели, и файрвол о них не знает."
+    dim "  сейчас слушают tcp: $(fw_listening_tcp | tr '\n' ' ')"
+    dim "  всё, чего нет выше, будет закрыто — добавляй через --allow-tcp"
+    say ""
+    dim "После применения правила снимутся сами через $FW_GRACE секунд, если не"
+    dim "подтвердить их ИЗ НОВОГО ssh-подключения."
+    say ""
+}
+
+fw_apply() {
+    fw_guard
+    [ -n "$FW_NODE_PORT" ] || FW_NODE_PORT="$(fw_node_port)"
+
+    local cand; cand="$(mktemp)"
+    fw_build_ruleset "$cand"
+    if ! nft -c -f "$cand" 2>/dev/null; then
+        nft -c -f "$cand" 2>&1 | head -10
+        rm -f "$cand"; die "nft не принял правила — ничего не применяю."
+    fi
+    ok "синтаксис правил проверен"
+
+    mkdir -p "$STATE_DIR"
+    nft list ruleset > "$BACKUP_DIR/nft-before.rules" 2>/dev/null || true
+
+    # Страховка ставится ДО правил. Не встала — не применяем вовсе.
+    systemctl stop "${FW_REVERT}.timer" "${FW_REVERT}.service" >/dev/null 2>&1 || true
+    systemd-run --on-active="$FW_GRACE" --unit="$FW_REVERT" --collect \
+        nft delete table inet "$FW_TABLE" >/dev/null 2>&1 || true
+    if ! systemctl is-active --quiet "${FW_REVERT}.timer" 2>/dev/null; then
+        rm -f "$cand"
+        die "Не удалось поставить таймер автоотката. Правила НЕ применены —
+   без страховки на машине без консоли это игра в рулетку."
+    fi
+    ok "страховка поставлена: через $FW_GRACE с правила снимутся сами"
+
+    install -m 0644 "$cand" "$STATE_DIR/firewall.candidate.nft"
+    rm -f "$cand"
+
+    if ! nft -f "$STATE_DIR/firewall.candidate.nft"; then
+        systemctl stop "${FW_REVERT}.timer" >/dev/null 2>&1 || true
+        die "Применить правила не удалось."
+    fi
+    record nfttable "$FW_TABLE"
+    ok "правила применены"
+
+    # Запоминаем клиентский порт этой сессии: подтверждение должно прийти
+    # с другого, иначе это та же сессия, которая живёт на established.
+    local peer; peer="$(fw_session_peer)"
+    { printf 'client_port=%s\n' "$(printf '%s' "$peer" | awk '{print $2}')"
+      printf 'backup=%s\n' "$BACKUP_DIR"
+    } > "$FW_PENDING"
+
+    say ""
+    printf '%s  ─── НЕ ЗАКРЫВАЙ ЭТУ СЕССИЮ ───%s\n' "$CW" "$CN"
+    say ""
+    dim "Открой ВТОРОЕ ssh-подключение к серверу и выполни там:"
+    printf '\n    %ssudo %s firewall confirm%s\n\n' "$CW" "$PROG" "$CN"
+    dim "Проверять в этой же сессии бесполезно: она работает по established и"
+    dim "продолжит работать, даже если новые подключения уже отбиваются."
+    dim "Не подтвердишь за $FW_GRACE секунд — правила снимутся, доступ вернётся."
+    say ""
+}
+
+fw_persist() {
+    mkdir -p "$FW_DIR"
+    save_or_new "$FW_FILE"
+    install -m 0644 "$STATE_DIR/firewall.candidate.nft" "$FW_FILE"
+
+    local unit="/etc/systemd/system/$FW_UNIT"
+    save_or_new "$unit"
+    {
+        printf '# %s %s\n' "$MARKER" "$VERSION"
+        printf '[Unit]\n'
+        printf 'Description=HUBTune firewall (nftables, table inet %s)\n' "$FW_TABLE"
+        printf '# после штатного nftables.service: если у него в конфиге flush ruleset,\n'
+        printf '# он не должен снести нашу таблицу уже после нас\n'
+        printf 'After=nftables.service network-pre.target\n'
+        printf 'Wants=network-pre.target\n\n'
+        printf '[Service]\n'
+        printf 'Type=oneshot\n'
+        printf 'RemainAfterExit=yes\n'
+        printf 'ExecStart=/usr/sbin/nft -f %s\n' "$FW_FILE"
+        printf 'ExecStop=/usr/sbin/nft delete table inet %s\n\n' "$FW_TABLE"
+        printf '[Install]\n'
+        printf 'WantedBy=multi-user.target\n'
+    } > "$unit"
+    chmod 0644 "$unit"
+    systemctl daemon-reload
+    systemctl enable "$FW_UNIT" >/dev/null 2>&1 \
+        || warn "не удалось включить $FW_UNIT в автозагрузку"
+    record unit "$FW_UNIT"
+    ok "правила закреплены и переживут перезагрузку: $FW_FILE"
+}
+
+cmd_firewall() {
+    require_root
+    detect_host
+    TG_MODE="server"
+    fw_render_plan
+    confirm "Применить правила файрвола?" || { dim "Отменено."; say ""; return 0; }
+    backup_init
+    trap on_error ERR
+    APPLY_STARTED=1
+    fw_apply
+    trap - ERR
+    APPLY_STARTED=0
+    return 0
+}
+
+cmd_fw_confirm() {
+    require_root
+    [ -f "$FW_PENDING" ] \
+        || die "Нечего подтверждать: нет правил, ожидающих подтверждения."
+
+    local saved_port cur_port peer
+    saved_port="$(awk -F= '$1=="client_port"{print $2; exit}' "$FW_PENDING" 2>/dev/null || true)"
+    BACKUP_DIR="$(awk -F= '$1=="backup"{print $2; exit}' "$FW_PENDING" 2>/dev/null || true)"
+    MANIFEST="$BACKUP_DIR/manifest.tsv"
+    peer="$(fw_session_peer)"
+    cur_port="$(printf '%s' "$peer" | awk '{print $2}')"
+
+    if [ -n "$saved_port" ] && [ "$saved_port" = "$cur_port" ]; then
+        die "Это та же сессия, из которой правила применялись.
+   Она живёт по established и ничего не доказывает. Открой новое подключение."
+    fi
+    ok "подтверждение пришло из нового подключения"
+
+    systemctl stop "${FW_REVERT}.timer" "${FW_REVERT}.service" >/dev/null 2>&1 || true
+    if systemctl is-active --quiet "${FW_REVERT}.timer" 2>/dev/null; then
+        die "Таймер автоотката не остановился — не рискую закреплять правила."
+    fi
+    ok "автооткат отменён"
+
+    fw_persist
+    rm -f "$FW_PENDING"
+    say ""; ok "Файрвол включён и закреплён."
+    dim "снять: $PROG rollback"; say ""
 }
 
 # ═══════════════════════════════════ меню ═══════════════════════════════════
@@ -1598,10 +1932,10 @@ cmd_menu() {
 ' "$CW" "$CN"
     printf '                  %sМеняет настройки хоста — смотри план перед подтверждением.%s
 ' "$CD" "$CN"
-    printf '  %s3%s) Посмотреть  подробный отчёт, ничего не менять.
-' "$CW" "$CN"
-    printf '  %s4%s) Откатить    вернуть то, что сделал прошлый запуск.
-' "$CW" "$CN"
+    printf '  %s3%s) Файрвол     nftables с автооткатом: не подтвердил из нового\n' "$CW" "$CN"
+    printf '                  %sподключения — правила снимаются сами.%s\n' "$CD" "$CN"
+    printf '  %s4%s) Посмотреть  подробный отчёт, ничего не менять.\n' "$CW" "$CN"
+    printf '  %s5%s) Откатить    вернуть то, что сделал прошлый запуск.\n' "$CW" "$CN"
     printf '  %s0%s) Выход
 ' "$CW" "$CN"
     printf '
@@ -1613,10 +1947,11 @@ cmd_menu() {
     case "$choice" in
         1) MODE="safe"; apply_mode; CMD="apply";    cmd_apply ;;
         2) MODE="full"; apply_mode; CMD="apply";    cmd_apply ;;
-        3) CMD="status";   cmd_status ;;
-        4) CMD="rollback"; cmd_rollback ;;
+        3) CMD="firewall"; cmd_firewall ;;
+        4) CMD="status";   cmd_status ;;
+        5) CMD="rollback"; cmd_rollback ;;
         0|"") dim "Выход."; say "" ;;
-        *) die "Не понял «$choice». Ожидались 0-4." ;;
+        *) die "Не понял «$choice». Ожидались 0-5." ;;
     esac
     return 0
 }
@@ -1708,6 +2043,16 @@ parse_args() {
     while [ $# -gt 0 ]; do
         case "$1" in
             status|plan|apply|rollback|version|help|menu) [ -z "$CMD" ] && CMD="$1" ;;
+            firewall|fw)    [ -z "$CMD" ] && CMD="firewall" ;;
+            confirm)        FW_CONFIRM=1 ;;
+            --allow-tcp)    [ $# -ge 2 ] || die "Опция --allow-tcp требует значение."; FW_ALLOW_TCP="$2"; shift ;;
+            --allow-tcp=*)  FW_ALLOW_TCP="${1#*=}" ;;
+            --allow-udp)    [ $# -ge 2 ] || die "Опция --allow-udp требует значение."; FW_ALLOW_UDP="$2"; shift ;;
+            --allow-udp=*)  FW_ALLOW_UDP="${1#*=}" ;;
+            --panel-ip)     [ $# -ge 2 ] || die "Опция --panel-ip требует значение."; FW_PANEL_IP="$2"; shift ;;
+            --panel-ip=*)   FW_PANEL_IP="${1#*=}" ;;
+            --grace)        [ $# -ge 2 ] || die "Опция --grace требует значение."; FW_GRACE="$2"; shift ;;
+            --grace=*)      FW_GRACE="${1#*=}" ;;
             --target)        [ $# -ge 2 ] || die "Опция --target требует значение."; OPT_TARGET="$2"; shift ;;
             --target=*)     OPT_TARGET="${1#*=}" ;;
             --mem-limit)     [ $# -ge 2 ] || die "Опция --mem-limit требует значение."; OPT_MEM="$2"; shift ;;
@@ -1757,6 +2102,17 @@ validate_opts() {
     parse_mib "$LOG_MAX_SIZE" >/dev/null 2>&1 \
         || die "--log-size: нужен размер вида 10m, 50m, 1g; получено «$LOG_MAX_SIZE»."
     is_uint "$NOFILE" || die "--nofile: нужно целое число, получено «$NOFILE»."
+    is_uint "$FW_GRACE" && [ "$FW_GRACE" -ge 30 ] && [ "$FW_GRACE" -le 3600 ] \
+        || die "--grace: нужно целое от 30 до 3600 секунд, получено «$FW_GRACE».
+   Меньше 30 не хватит, чтобы успеть открыть второе подключение."
+    local port
+    while IFS= read -r port; do
+        [ -n "$port" ] || continue
+        is_uint "$port" && [ "$port" -ge 1 ] && [ "$port" -le 65535 ] \
+            || die "Порт «$port» — не число от 1 до 65535."
+    done <<EOF
+$(printf '%s,%s' "$FW_ALLOW_TCP" "$FW_ALLOW_UDP" | tr ',' '\n')
+EOF
     local nr_open=1048576
     if [ -r /proc/sys/fs/nr_open ]; then nr_open="$(cat /proc/sys/fs/nr_open)"; fi
     is_uint "$nr_open" || nr_open=1048576
@@ -1791,6 +2147,7 @@ main() {
     printf '%s╭─ HUBTune %s%s\n' "$CW" "$VERSION" "$CN"
 
     case "$CMD" in
+        firewall) if [ "$FW_CONFIRM" = "1" ]; then cmd_fw_confirm; else cmd_firewall; fi ;;
         menu)     cmd_menu ;;
         status)   cmd_status ;;
         plan)     cmd_plan ;;
