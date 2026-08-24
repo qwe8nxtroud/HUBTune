@@ -16,7 +16,8 @@ docker() {                      # подставляем docker целиком
 }
 reset() {
     TG_MODE=""; TG_KIND=""; TG_LABEL=""; TG_CONTAINER=""; TG_IMAGE=""
-    TG_SERVICE=""; TG_WORKDIR=""; TG_BASEFILE=""; TG_CONFIGS=""; TG_OVERRIDE=""; PANEL_SEEN=0
+    TG_SERVICE=""; TG_WORKDIR=""; TG_BASEFILE=""; TG_CONFIGS=""; TG_OVERRIDE=""
+    TG_PROJECT=""; PANEL_SEEN=0
     OPT_TARGET=""
 }
 
@@ -28,6 +29,7 @@ eq "цель найдена"    "0"          "$rc"
 eq "kind"            "remnanode"  "$TG_KIND"
 eq "контейнер"       "remnanode"  "$TG_CONTAINER"
 eq "сервис"          "remnanode"  "$TG_SERVICE"
+eq "имя проекта"     "remnanode"  "$TG_PROJECT"
 eq "панель не видна" "0"          "$PANEL_SEEN"
 
 echo "== хост панели Remnawave (ноды нет) =="
@@ -57,6 +59,7 @@ detect_docker_target
 eq "выбран 3x-ui, не postgres" "3xui_app" "$TG_CONTAINER"
 eq "kind"                      "3x-ui"    "$TG_KIND"
 eq "имя сервиса из метки"      "3xui"     "$TG_SERVICE"
+eq "имя проекта из метки"      "3x-ui"    "$TG_PROJECT"
 
 echo "== посторонние контейнеры игнорируются =="
 reset

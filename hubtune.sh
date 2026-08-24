@@ -64,7 +64,6 @@ EX_SWAP=""; EX_SYSCTL=""; EX_BBR=""
 BACKUP_DIR=""
 MANIFEST=""
 ARGC=0
-CHANGED=0
 
 # ═════════════════════════════════ утилиты ══════════════════════════════════
 
@@ -291,9 +290,9 @@ classify_image() {
 detect_docker_target() {
     local name image project service workdir configs state kind rank
     local n=0 i=0 best_rank=99 ties=0 chosen=-1
-    local c_name c_image c_service c_workdir c_configs c_kind c_rank c_state
+    local c_name c_image c_project c_service c_workdir c_configs c_kind c_rank c_state
     # bash 3.2-совместимые массивы объявляем без -A
-    c_name=(); c_image=(); c_service=(); c_workdir=()
+    c_name=(); c_image=(); c_project=(); c_service=(); c_workdir=()
     c_configs=(); c_kind=(); c_rank=(); c_state=()
 
     while IFS=$'\t' read -r name image project service workdir configs state; do
@@ -320,7 +319,8 @@ detect_docker_target() {
         if [ "$state" != "running" ]; then rank=$(( rank + 10 )); fi
 
         c_name[$n]="$name";       c_image[$n]="$image"
-        c_service[$n]="$service"; c_workdir[$n]="$workdir"
+        c_project[$n]="$project"; c_service[$n]="$service"
+        c_workdir[$n]="$workdir"
         c_configs[$n]="$configs"; c_kind[$n]="$kind"
         c_rank[$n]="$rank";       c_state[$n]="$state"
         if [ "$rank" -lt "$best_rank" ]; then best_rank="$rank"; fi
@@ -359,6 +359,7 @@ detect_docker_target() {
     TG_KIND="${c_kind[$chosen]}"
     TG_CONTAINER="${c_name[$chosen]}"
     TG_IMAGE="${c_image[$chosen]}"
+    TG_PROJECT="${c_project[$chosen]}"
     TG_SERVICE="${c_service[$chosen]}"
     TG_WORKDIR="${c_workdir[$chosen]}"
     TG_CONFIGS="${c_configs[$chosen]}"
@@ -629,10 +630,9 @@ cmd_status() {
     resolve_compose_paths
     read_current_state
 
-    local want_mem_mib want_mem_bytes
+    local want_mem_mib
     if [ -n "$OPT_MEM" ]; then want_mem_mib="$(parse_mib "$OPT_MEM")"
     else want_mem_mib="$(calc_limit_mib "$HOST_RAM_MIB")"; fi
-    want_mem_bytes=$(( want_mem_mib * 1048576 ))
 
     hdr "Хост"
     info "ОС              $HOST_OS ($(uname -m)), виртуализация: $HOST_VIRT"
@@ -1363,10 +1363,6 @@ cmd_apply() {
     detect_host
     detect_target || die_no_target
     resolve_compose_paths
-    if [ "$TG_MODE" = "docker" ]; then
-        TG_PROJECT="$(docker inspect --format '{{index .Config.Labels "com.docker.compose.project"}}' "$TG_CONTAINER" 2>/dev/null || true)"
-        [ "$TG_PROJECT" = "<no value>" ] && TG_PROJECT=""
-    fi
     panel_guard
     read_current_state
     build_plan
@@ -1450,14 +1446,14 @@ restore_service() {
                 warn "каталог проекта не найден — подними вручную: docker compose up -d"
                 return 0
             fi
-            local -a a; a=(compose)
-            if [ -n "$proj" ]; then a+=(-p "$proj"); fi
-            a+=(--project-directory "$wd")
+            local -a up; up=(compose)
+            if [ -n "$proj" ]; then up+=(-p "$proj"); fi
+            up+=(--project-directory "$wd")
             while IFS= read -r f; do
-                if [ -n "$f" ] && [ -f "$f" ]; then a+=(-f "$f"); fi
+                if [ -n "$f" ] && [ -f "$f" ]; then up+=(-f "$f"); fi
             done < <(printf '%s' "$cfgs" | tr ',' '\n')
-            if [ -n "$svc" ]; then a+=(up -d --no-deps "$svc"); else a+=(up -d); fi
-            if docker "${a[@]}"; then ok "сервис поднят из исходной конфигурации"
+            if [ -n "$svc" ]; then up+=(up -d --no-deps "$svc"); else up+=(up -d); fi
+            if docker "${up[@]}"; then ok "сервис поднят из исходной конфигурации"
             else warn "поднять сервис не удалось — смотри docker compose logs"; fi ;;
         systemd)
             unit="$(about_get unit "$dir")"
@@ -1611,16 +1607,16 @@ cmd_menu() {
     printf '
 Номер: '
 
-    local a=""
-    read -r a < /dev/tty || a="0"
+    local choice=""
+    read -r choice < /dev/tty || choice="0"
     say ""
-    case "$a" in
+    case "$choice" in
         1) MODE="safe"; apply_mode; CMD="apply";    cmd_apply ;;
         2) MODE="full"; apply_mode; CMD="apply";    cmd_apply ;;
         3) CMD="status";   cmd_status ;;
         4) CMD="rollback"; cmd_rollback ;;
         0|"") dim "Выход."; say "" ;;
-        *) die "Не понял «$a». Ожидались 0-4." ;;
+        *) die "Не понял «$choice». Ожидались 0-4." ;;
     esac
     return 0
 }

@@ -1,6 +1,22 @@
+<div align="center">
+
 # HUBTune
 
+**Защита VPN-ноды от OOM, разрастания логов и нехватки дескрипторов**
+
 [![tests](https://github.com/qwe8nxtroud/HUBTune/actions/workflows/tests.yml/badge.svg)](https://github.com/qwe8nxtroud/HUBTune/actions/workflows/tests.yml)
+[![bash](https://img.shields.io/badge/bash-4%2B-4EAA25?logo=gnubash&logoColor=white)](#установка)
+[![platform](https://img.shields.io/badge/Linux-docker%20%7C%20systemd-0078D6?logo=linux&logoColor=white)](#по-платформам)
+[![targets](https://img.shields.io/badge/Remnawave%20node%20%C2%B7%203x--ui-8A2BE2)](#по-платформам)
+[![license](https://img.shields.io/badge/license-MIT-3DA639)](LICENSE)
+
+[Установка](#установка) · [Режимы](#три-режима-вместо-пятнадцати-флагов) ·
+[Почему ноды умирают](#почему-ноды-умирают) · [Откат](#откат) ·
+[vpn-hub.pro](https://vpn-hub.pro)
+
+</div>
+
+---
 
 **Нода падает не от нагрузки, а от памяти.** Один скрипт, который ставит сервису границу
 по RAM, включает ротацию логов и поднимает лимит дескрипторов — на Remnawave node и 3x-ui.
@@ -67,6 +83,7 @@ Xray. Но:
 поднимает обратно за секунду, SSH и Docker живы, а счётчик `memory.events/oom_kill`
 честно показывает, сколько раз это случилось.
 
+> [!IMPORTANT]
 > Лимит **не лечит утечку**. Он превращает «сервер отвалился, непонятно почему» в
 > «сервис перезапустился за секунду, вот счётчик». Это разные аварии.
 
@@ -176,8 +193,9 @@ HUBTune 1.0.0
 
 ## Установка
 
-Скрипт запускается от root и меняет боевой сервер, поэтому **без `curl | bash`** —
-сначала скачайте и посмотрите глазами:
+> [!CAUTION]
+> Скрипт запускается от root и меняет боевой сервер. Никаких `curl … | bash` —
+> сначала скачайте и посмотрите глазами.
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/qwe8nxtroud/HUBTune/main/hubtune.sh -o hubtune.sh
@@ -400,15 +418,14 @@ systemctl is-enabled docker
 - ротацию `access.log` Xray через logrotate с `copytruncate` (Xray держит файл открытым
   и не переоткрывает его по сигналу — обычный `create` отправил бы запись в никуда).
 
-⚠️ **Важно про `StartLimitBurst`.** Вендорный `x-ui.service` приезжает с
-`StartLimitBurst=10` и `StartLimitIntervalSec=180`: если сервис упадёт 10 раз за 3 минуты,
-systemd **перестанет его поднимать вообще**. Если вы поставите слишком жёсткий лимит
-памяти и x-ui начнёт крутиться в OOM-цикле — нода не встанет сама. Скрипт предупреждает
-об этом после применения. Снять запрет:
-
-```bash
-systemctl reset-failed x-ui.service
-```
+> [!WARNING]
+> **`StartLimitBurst` может оставить ноду лежать.** Вендорный `x-ui.service` приезжает
+> с `StartLimitBurst=10` и `StartLimitIntervalSec=180`: если сервис упадёт 10 раз за
+> 3 минуты, systemd **перестанет его поднимать вообще**. Слишком жёсткий лимит памяти →
+> x-ui крутится в OOM-цикле → нода не встаёт сама. Скрипт предупреждает об этом сразу
+> после применения.
+>
+> Снять запрет: `systemctl reset-failed x-ui.service`
 
 ### Что-нибудь ещё
 
@@ -587,7 +604,21 @@ bash tests/test-logic.sh
 
 ## Лицензия
 
-MIT.
+MIT — делайте что хотите, но без гарантий. См. [LICENSE](LICENSE).
+
+---
+
+<div align="center">
+
+### [vpn-hub.pro](https://vpn-hub.pro)
+
+Статьи и разборы по Remnawave, Xray и собственным VPN-сервисам:<br>
+настройка нод, обход блокировок, диагностика и то, из-за чего всё это ломается.
+
+[![сайт](https://img.shields.io/badge/vpn--hub.pro-читать-2D7FF9)](https://vpn-hub.pro)
+[![сообщество](https://img.shields.io/badge/Telegram-@vpnhub__community-26A5E4?logo=telegram&logoColor=white)](https://t.me/vpnhub_community)
+
+</div>
 
 [i5549]: https://github.com/MHSanaei/3x-ui/issues/5549
 [i1234]: https://github.com/MHSanaei/3x-ui/issues/1234
