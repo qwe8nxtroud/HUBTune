@@ -1616,9 +1616,9 @@ fw_ssh_ports() {
 
 # Адрес и порт того пира, которого реально видит файрвол.
 fw_session_peer() {   # печатает: <ip клиента> <порт клиента> <порт сервера>
-    local cip="" cport="" srv="" sport=""
+    local cip="" cport="" sport=""
     if [ -n "${SSH_CONNECTION:-}" ]; then
-        read -r cip cport srv sport <<EOF
+        read -r cip cport _ sport <<EOF
 ${SSH_CONNECTION}
 EOF
     else
@@ -1650,7 +1650,7 @@ fw_node_port() {
 # Собираем правила. Идиома `table; delete table; table {...}` — атомарная
 # замена одной таблицы: create-if-absent, снести, положить новую.
 fw_build_ruleset() {   # $1 — файл назначения
-    local out="$1" p ssh_ports tcp udp
+    local out="$1" p ssh_ports
     ssh_ports="$(fw_ssh_ports)"
     {
         printf '#!/usr/sbin/nft -f\n'
