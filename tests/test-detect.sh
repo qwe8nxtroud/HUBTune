@@ -1,5 +1,9 @@
 #!/usr/bin/env bash
 # Проверка выбора цели и генерации override на подставном `docker`.
+#
+# SC2034: переменные ниже не «неиспользуемые» — их читают функции из hubtune.sh,
+# подключённого следующей строкой. Связь через `.` shellcheck не отслеживает.
+# shellcheck disable=SC2034
 HUBTUNE_LIB=1 . "$(dirname "$0")/../hubtune.sh"
 
 PASS=0; FAIL=0
