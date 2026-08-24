@@ -1,0 +1,28 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Версия bash
+        run: bash --version | head -1
+
+      - name: Проверка синтаксиса
+        run: bash -n hubtune.sh
+
+      - name: Тесты
+        run: bash tests/run-all.sh
+
+      # Советы shellcheck смотрим, но сборку из-за них не роняем:
+      # часть его замечаний к этому стилю кода неприменима.
+      - name: ShellCheck (справочно)
+        continue-on-error: true
+        run: shellcheck -S warning hubtune.sh
