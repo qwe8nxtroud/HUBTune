@@ -1116,9 +1116,13 @@ dc() {
     args=(compose)
     if [ -n "$TG_PROJECT" ]; then args+=(-p "$TG_PROJECT"); fi
     args+=(--project-directory "$TG_WORKDIR")
+    local added=0
     while IFS= read -r f; do
-        if [ -n "$f" ] && [ -f "$f" ]; then args+=(-f "$f"); fi
-    done < <(printf '%s' "${TG_CONFIGS:-$TG_BASEFILE}" | tr ',' '\n')
+        if [ -n "$f" ] && [ -f "$f" ]; then args+=(-f "$f"); added=1; fi
+    done < <(printf '%s' "${TG_CONFIGS:-}" | tr ',' '\n')
+    # Если список почему-то пуст, compose получит только override — а в нём нет
+    # ни image, ни build. Базовый файл добавляем всегда как последний рубеж.
+    if [ "$added" = "0" ] && [ -f "$TG_BASEFILE" ]; then args+=(-f "$TG_BASEFILE"); fi
     if [ -f "$TG_OVERRIDE" ]; then args+=(-f "$TG_OVERRIDE"); fi
     docker "${args[@]}" "$@"
 }
@@ -1206,8 +1210,13 @@ apply_docker() {
     ok "записан $TG_OVERRIDE"
 
     if compose_ready; then
-        dc config -q >/dev/null 2>&1 \
-            || { dc config 2>&1 | tail -20; die "compose не принял конфигурацию — откатываюсь."; }
+        if ! dc config -q >/dev/null 2>&1; then
+            # Снимаем ловушку: иначе диагностический вызов сработает как ошибка
+            # и запустит откат раньше, чем die объяснит, что произошло.
+            trap - ERR
+            dc config 2>&1 | tail -20 || true
+            die "compose не принял конфигурацию — откатываюсь."
+        fi
         ok "конфигурация compose валидна"
     else
         warn "docker compose v2 недоступен — файл записан, но контейнер не пересоздан."
@@ -1483,9 +1492,16 @@ restore_service() {
             local -a up; up=(compose)
             if [ -n "$proj" ]; then up+=(-p "$proj"); fi
             up+=(--project-directory "$wd")
+            local nf=0
             while IFS= read -r f; do
-                if [ -n "$f" ] && [ -f "$f" ]; then up+=(-f "$f"); fi
+                if [ -n "$f" ] && [ -f "$f" ]; then up+=(-f "$f"); nf=1; fi
             done < <(printf '%s' "$cfgs" | tr ',' '\n')
+            if [ "$nf" = "0" ]; then
+                for f in "$wd"/docker-compose.yml "$wd"/docker-compose.yaml \
+                         "$wd"/compose.yml "$wd"/compose.yaml; do
+                    if [ -f "$f" ]; then up+=(-f "$f"); break; fi
+                done
+            fi
             if [ -n "$svc" ]; then up+=(up -d --no-deps "$svc"); else up+=(up -d); fi
             if docker "${up[@]}"; then ok "сервис поднят из исходной конфигурации"
             else warn "поднять сервис не удалось — смотри docker compose logs"; fi ;;
