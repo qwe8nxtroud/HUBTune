@@ -107,8 +107,11 @@ die() {
 
 confirm() {
     [ "$ASSUME_YES" = "1" ] && return 0
-    if [ ! -r /dev/tty ]; then
-        die "Нужно подтверждение, но терминала нет. Перезапусти с --yes."
+    # Проверять [ -r /dev/tty ] мало: по ssh без -t файл существует, но не
+    # открывается, и редирект падает с «No such device or address».
+    if ! { : < /dev/tty; } 2>/dev/null; then
+        die "Нужно подтверждение, но управляющего терминала нет.
+   Так бывает при ssh без -t, в cron и в пайпе. Перезапусти с --yes."
     fi
     printf '\n%s%s%s [y/N] ' "$CY" "$1" "$CN" > /dev/tty
     local ans=""
@@ -159,6 +162,17 @@ fmt_bytes() {
 have() { command -v "$1" >/dev/null 2>&1; }
 
 is_uint() { case "${1:-}" in ''|*[!0-9]*) return 1 ;; *) return 0 ;; esac; }
+
+# На свежем VPS списки пакетов часто пустые, и install падает с «Unable to
+# locate package» даже для пакета из основного репозитория. Обновляем только
+# если кандидата действительно нет: лишний apt-get update на ноде не нужен.
+apt_install() {
+    have apt-get || return 1
+    if ! apt-cache policy "$1" 2>/dev/null | grep -q 'Candidate: [^(]'; then
+        apt-get update >/dev/null 2>&1 || true
+    fi
+    DEBIAN_FRONTEND=noninteractive apt-get install -y "$@" >/dev/null 2>&1
+}
 
 # Три режима вместо пятнадцати флагов.
 #   memory — только граница по памяти, больше ничего
@@ -1735,7 +1749,15 @@ EOFU
     } > "$out"
 }
 fw_guard() {
-    fw_available || die "nft не установлен. apt install nftables"
+    if ! fw_available; then
+        have apt-get || die "nft не установлен, и apt-get тоже нет. Поставь nftables вручную."
+        warn "nft не установлен — в минимальной Ubuntu его нет из коробки"
+        confirm "Поставить пакет nftables?" || die "Без nft правила писать нечем."
+        apt_install nftables || die "Не удалось поставить nftables."
+        record pkg "nftables"
+        fw_available || die "nftables поставился, но команда nft не появилась."
+        ok "nftables установлен"
+    fi
     have systemd-run || die "нет systemd-run — без него не поставить страховочный таймер,
    а применять правила файрвола на удалённой машине без страховки нельзя."
     local m; m="$(fw_conflicting_manager)"
@@ -2773,6 +2795,11 @@ cmd_hygiene() {
     detect_host
     TG_MODE="server"
 
+    # Команда наследует режим safe, где DO_BBR=0. Но это и есть модуль сетевого
+    # тюнинга: молча не включить BBR тут — то же самое, что не сделать работу.
+    # Явный --no-bbr по-прежнему сильнее.
+    [ -z "$EX_BBR" ] && DO_BBR=1
+
     # Серверный набор — надмножество узлового, и уходит в тот же файл.
     # Два файла в /etc/sysctl.d с близкими именами дрались бы за одни ключи.
     PLAN_SYSCTL_BODY="$(build_sysctl_body_server)"
@@ -3253,8 +3280,8 @@ cmd_ssh() {
 # В пайпе, cron и по ssh с командой меню не показывается — там остаётся plan.
 cmd_menu() {
     # menu можно позвать и явно — тогда терминала может не оказаться
-    if [ ! -r /dev/tty ]; then
-        warn "Терминала нет — показываю план вместо меню."
+    if ! { : < /dev/tty; } 2>/dev/null; then
+        warn "Управляющего терминала нет — показываю план вместо меню."
         cmd_plan
         return 0
     fi
