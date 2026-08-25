@@ -1967,7 +1967,7 @@ KRN_APT_URL="http://deb.xanmod.org"
 # у XanMod один общий репозиторий на все Debian/Ubuntu разом, а не codename
 # конкретного дистрибутива — "releases" тут ровно то же самое, что codename
 # в примере из задания, просто зафиксированное значение, а не lsb_release
-KRN_APT_SUITE="releases"
+KRN_APT_SUITE=""          # кодовое имя дистрибутива; заполняет krn_detect
 KRN_BOOT_MIN_MIB=300          # меньше — initramfs не соберётся (известный отказ на Oracle Cloud)
 
 # Заполняет krn_detect(), см. интерфейс ниже.
@@ -2086,6 +2086,8 @@ krn_detect() {
 
     KRN_CURRENT="$(uname -r)"
     KRN_BBR_VER="$(krn_bbr_module_version)"
+    KRN_APT_SUITE="$(. /etc/os-release 2>/dev/null && printf '%s' "${VERSION_CODENAME:-}")"
+
     return 0
 }
 
@@ -2133,10 +2135,33 @@ krn_blockers() {
         fi
     fi
 
+    if [ -z "$KRN_APT_SUITE" ]; then
+        bad "не удалось определить кодовое имя дистрибутива (VERSION_CODENAME)"
+        n=$(( n + 1 ))
+    elif ! krn_suite_published "$KRN_APT_SUITE"; then
+        bad "XanMod не публикует пакеты для «$KRN_APT_SUITE»"
+        dim "  каталога $KRN_APT_URL/dists/$KRN_APT_SUITE нет."
+        dim "  Поддерживаются свежие выпуски (noble, bookworm, trixie и новее)."
+        dim "  Вариантов два: обновить дистрибутив либо остаться на BBR v1,"
+        dim "  который включается одним sysctl и уже делается пунктом «Сеть»."
+        n=$(( n + 1 ))
+    fi
+
     [ "$n" -eq 0 ]
 }
 
 # ═══════════════════════════════════ план ═══════════════════════════════════
+
+# Suite у XanMod — кодовое имя дистрибутива, и публикуют они не для всех.
+# Для jammy (Ubuntu 22.04) каталога уже нет. Проверяем ДО того, как трогать
+# apt: иначе пользователь получит «does not have a Release file» и гадание.
+krn_suite_published() {
+    local suite="$1" code=""
+    have curl || return 0
+    code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 15 \
+        "$KRN_APT_URL/dists/$suite/InRelease" 2>/dev/null || echo 000)"
+    [ "$code" = "200" ]
+}
 
 krn_render_plan() {
     local pkg blockers_out
