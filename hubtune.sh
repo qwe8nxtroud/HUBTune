@@ -1911,6 +1911,432 @@ cmd_fw_confirm() {
     dim "снять: $PROG rollback"; say ""
 }
 
+# ══════════════════════════ ядро XanMod и BBRv3 ═════════════════════════════
+# ══════════════════════════ ядро XanMod (BBRv3) ═════════════════════════════
+# shellcheck shell=bash
+#
+#  Фрагмент для вставки в hubtune.sh. Не самостоятельный скрипт: рассчитан на
+#  общий контекст hubtune.sh (set -Eeuo pipefail, root, готовые helper'ы
+#  ok/warn/bad/info/dim/die/hdr/say/have/is_uint/confirm/fmt_mib/record/
+#  save_or_new/require_root и переменные $MARKER/$VERSION/$PROG/$BACKUP_DIR/
+#  $HOST_VIRT/$HOST_DISK_FREE_MIB/$FORCE).
+#
+#  BBRv3 не входит в mainline: в стоковом ядре есть только BBR v1, ради v3
+#  нужно стороннее ядро XanMod. Имя "bbr3" в tcp_available_congestion_control
+#  может вообще не появиться — часть сборок v3 использует то же имя "bbr",
+#  что и v1/v2, поэтому единственная достоверная проверка — версия модуля
+#  tcp_bbr (см. krn_bbr_module_version).
+#
+#  Порядок вызова: krn_detect → krn_blockers/krn_render_plan → krn_apply.
+#  confirm(), backup_init и trap on_error ERR — забота вызывающей стороны,
+#  как у hyg_render_plan()/hyg_apply(). Откат "pkg" уже умеет rollback_from()
+#  (кейс pkg защищает от удаления кернела, на котором система работает прямо
+#  сейчас) — доделывать не нужно. apt-mark hold на старое ядро откатом
+#  сознательно не снимается: это постоянная страховка, а не временное
+#  состояние apply.
+
+KRN_KEYRING="/etc/apt/keyrings/xanmod-archive-keyring.gpg"
+KRN_LIST_FILE="/etc/apt/sources.list.d/xanmod-release.list"
+KRN_KEY_URL="https://dl.xanmod.org/archive.key"
+KRN_APT_URL="http://deb.xanmod.org"
+# у XanMod один общий репозиторий на все Debian/Ubuntu разом, а не codename
+# конкретного дистрибутива — "releases" тут ровно то же самое, что codename
+# в примере из задания, просто зафиксированное значение, а не lsb_release
+KRN_APT_SUITE="releases"
+KRN_BOOT_MIN_MIB=300          # меньше — initramfs не соберётся (известный отказ на Oracle Cloud)
+
+# Заполняет krn_detect(), см. интерфейс ниже.
+KRN_VIRT=""                   # результат systemd-detect-virt
+KRN_SB="unknown"              # off | on | unknown — состояние Secure Boot
+KRN_PSABI=""                  # x64v1..x64v4 — максимальный уровень psABI по флагам CPU
+KRN_BOOT_FREE_MIB=0           # свободно в /boot, МиБ
+KRN_HAS_GRUB=0                # 1 — есть grub.cfg и update-grub/grub-mkconfig
+KRN_CURRENT=""                # uname -r на момент детекта (это ядро остаётся запасным)
+KRN_BBR_VER=""                # modinfo tcp_bbr | version; пусто — модуль не найден
+
+# ═══════════════════════════════ разведка ═══════════════════════════════════
+
+# off | on | unknown. mokutil — основной путь; если его нет, читаем EFI-
+# переменную напрямую. Секьюрбут не даёт грузиться неподписанному ядру
+# XanMod, поэтому "не смогли определить" и "точно выключен" разводим отдельно.
+krn_secure_boot_state() {
+    local out var_file
+
+    if have mokutil; then
+        out="$(mokutil --sb-state 2>/dev/null || true)"
+        case "$out" in
+            *"SecureBoot enabled"*)  printf 'on';  return 0 ;;
+            *"SecureBoot disabled"*) printf 'off'; return 0 ;;
+        esac
+    fi
+
+    if [ ! -d /sys/firmware/efi ]; then
+        # легаси-BIOS: EFI нет вообще, Secure Boot архитектурно невозможен
+        printf 'off'
+        return 0
+    fi
+
+    if have efivar; then
+        out="$(efivar -n 8be4df61-93ca-11d2-aa0d-00e098032b8c-SecureBoot -p 2>/dev/null || true)"
+        case "$out" in
+            *[Ee]nabled*)  printf 'on';  return 0 ;;
+            *[Dd]isabled*) printf 'off'; return 0 ;;
+        esac
+    fi
+
+    # ни mokutil, ни efivar: читаем efivarfs сырьём. Первые 4 байта файла —
+    # атрибуты EFI-переменной, пятый байт — само значение SecureBoot (0/1)
+    var_file="$(find /sys/firmware/efi/efivars -maxdepth 1 -iname 'SecureBoot-*' 2>/dev/null | head -n1)"
+    if [ -n "$var_file" ] && [ -r "$var_file" ]; then
+        out="$(od -An -tu1 "$var_file" 2>/dev/null | awk '{print $5}')"
+        case "$out" in
+            1) printf 'on';  return 0 ;;
+            0) printf 'off'; return 0 ;;
+        esac
+    fi
+
+    printf 'unknown'
+    return 1
+}
+
+# Флаги CPU из /proc/cpuinfo первого ядра: на VDS/выделенных серверах у всех
+# vCPU один и тот же набор, гетерогенные конфигурации сюда не целимся.
+krn_cpu_has_flags() {
+    local flags="$1" f
+    shift
+    for f in "$@"; do
+        case " $flags " in
+            *" $f "*) ;;
+            *) return 1 ;;
+        esac
+    done
+    return 0
+}
+
+# Максимальный поддерживаемый уровень x86-64 psABI. Неверный уровень —
+# illegal instruction прямо при старте ядра, поэтому смотрим факт наличия
+# флагов локально, а не модель CPU и не сторонний скрипт из интернета.
+krn_psabi_level() {
+    local flags
+    flags="$(awk -F: '/^flags/{print $2; exit}' /proc/cpuinfo)"
+
+    local v2=(cx16 lahf_lm popcnt sse4_1 sse4_2 ssse3)
+    local v3=(avx avx2 bmi1 bmi2 f16c fma movbe xsave)
+    local v4=(avx512f avx512bw avx512cd avx512dq avx512vl)
+
+    if krn_cpu_has_flags "$flags" "${v2[@]}" "${v3[@]}" "${v4[@]}"; then
+        printf 'x64v4'
+    elif krn_cpu_has_flags "$flags" "${v2[@]}" "${v3[@]}"; then
+        printf 'x64v3'
+    elif krn_cpu_has_flags "$flags" "${v2[@]}"; then
+        printf 'x64v2'
+    else
+        printf 'x64v1'
+    fi
+}
+
+# Версия модуля tcp_bbr — единственный надёжный признак BBRv3: часть сборок
+# v3 называет congestion control в /proc так же, как v1/v2, — просто "bbr".
+krn_bbr_module_version() {
+    have modinfo || return 0
+    modinfo tcp_bbr 2>/dev/null | awk '/^version:/{print $2; exit}'
+}
+
+krn_detect() {
+    KRN_VIRT="${HOST_VIRT:-unknown}"
+    if [ "$KRN_VIRT" = "unknown" ] && have systemd-detect-virt; then
+        KRN_VIRT="$(systemd-detect-virt 2>/dev/null || echo none)"
+    fi
+
+    KRN_SB="$(krn_secure_boot_state)" || true
+    KRN_PSABI="$(krn_psabi_level)"
+
+    KRN_BOOT_FREE_MIB="$(df -Pm /boot 2>/dev/null | awk 'NR==2{print $4}')"
+    is_uint "$KRN_BOOT_FREE_MIB" || KRN_BOOT_FREE_MIB="$HOST_DISK_FREE_MIB"
+
+    KRN_HAS_GRUB=0
+    if [ -f /boot/grub/grub.cfg ] && { have update-grub || have grub-mkconfig; }; then
+        KRN_HAS_GRUB=1
+    fi
+
+    KRN_CURRENT="$(uname -r)"
+    KRN_BBR_VER="$(krn_bbr_module_version)"
+    return 0
+}
+
+# ═══════════════════════════════ блокеры ════════════════════════════════════
+
+# По строке на каждую причину отказа. Возврат 0 — блокеров нет, 1 — есть.
+krn_blockers() {
+    local n=0
+
+    if ! have apt-get; then
+        bad "нет apt-get — репозиторий XanMod есть только для Debian/Ubuntu-подобных систем"
+        n=$(( n + 1 ))
+    fi
+
+    case "$KRN_VIRT" in
+        openvz|lxc|lxc-libvirt)
+            bad "виртуализация $KRN_VIRT — своё ядро физически невозможно, ядро общее с хостом"
+            n=$(( n + 1 )) ;;
+    esac
+
+    case "$KRN_SB" in
+        on)
+            bad "Secure Boot включён — ядро XanMod не подписано и не загрузится, выключи Secure Boot в прошивке"
+            n=$(( n + 1 )) ;;
+        unknown)
+            if [ "$FORCE" = "1" ]; then
+                warn "состояние Secure Boot не определилось (нет mokutil/efivar) — продолжаю из-за --force"
+            else
+                bad "состояние Secure Boot не определилось (нет mokutil/efivar) — повтори с --force, если точно знаешь, что он выключен"
+                n=$(( n + 1 ))
+            fi ;;
+    esac
+
+    if [ "$KRN_HAS_GRUB" != "1" ]; then
+        bad "не найден GRUB (/boot/grub/grub.cfg и update-grub/grub-mkconfig) — новое ядро некуда прописать"
+        n=$(( n + 1 ))
+    fi
+
+    if [ "$KRN_BOOT_FREE_MIB" -lt "$KRN_BOOT_MIN_MIB" ] 2>/dev/null; then
+        if [ "$FORCE" = "1" ]; then
+            warn "в /boot свободно $(fmt_mib "$KRN_BOOT_FREE_MIB") из требуемых $(fmt_mib "$KRN_BOOT_MIN_MIB") — продолжаю из-за --force"
+        else
+            bad "в /boot свободно $(fmt_mib "$KRN_BOOT_FREE_MIB"), нужно минимум $(fmt_mib "$KRN_BOOT_MIN_MIB") — иначе не соберётся initramfs"
+            n=$(( n + 1 ))
+        fi
+    fi
+
+    [ "$n" -eq 0 ]
+}
+
+# ═══════════════════════════════════ план ═══════════════════════════════════
+
+krn_render_plan() {
+    local pkg blockers_out
+    pkg="linux-xanmod-${KRN_PSABI:-x64v1}"
+
+    hdr "Ядро XanMod (BBRv3)"
+    info "сейчас              $KRN_CURRENT"
+    case "$KRN_CURRENT" in
+        *xanmod*) dim "уже загружено ядро XanMod — переустановка/обновление пакета ничего не сломает" ;;
+    esac
+    if [ -n "$KRN_BBR_VER" ]; then
+        if [ "$KRN_BBR_VER" = "3" ]; then
+            info "версия tcp_bbr      $KRN_BBR_VER (это уже BBRv3)"
+        else
+            info "версия tcp_bbr      $KRN_BBR_VER"
+        fi
+    else
+        info "версия tcp_bbr      модуль не загружен"
+    fi
+    info "уровень CPU         $KRN_PSABI"
+    ok   "пакет к установке: $pkg  (репозиторий deb.xanmod.org)"
+    dim  "ключ:    $KRN_KEYRING"
+    dim  "список:  $KRN_LIST_FILE"
+    ok   "$KRN_CURRENT останется в GRUB как запасной пункт"
+    dim  "пакеты текущего ядра получат apt-mark hold — иначе autoremove снесёт"
+    dim  "их вместе с запасным вариантом, если новое ядро не загрузится"
+
+    say ""
+    if blockers_out="$(krn_blockers)"; then
+        dim "Ничего не изменено."
+        return 0
+    fi
+    warn "установка заблокирована:"
+    printf '%s\n' "$blockers_out"
+    say ""
+    return 1
+}
+
+# ═══════════════════════════════════ apply ══════════════════════════════════
+
+# Пакеты, которые дают текущее ядро, — их нужно закрепить, чтобы apt
+# autoremove (в том числе автоматический, из unattended-upgrades) не снёс
+# запасной вариант вместе с только что поставленным новым ядром.
+krn_current_kernel_pkgs() {
+    dpkg-query -W -f='${Package}\n' 'linux-image-*' 'linux-headers-*' 'linux-modules-*' 2>/dev/null \
+        | grep -F -- "$KRN_CURRENT" || true
+}
+
+krn_apply() {
+    require_root
+    krn_detect
+
+    local blockers_out
+    if ! blockers_out="$(krn_blockers)"; then
+        printf '%s\n' "$blockers_out" >&2
+        die "установка ядра XanMod заблокирована, причины выше"
+    fi
+
+    local pkg="linux-xanmod-${KRN_PSABI:-x64v1}"
+    hdr "Установка ядра XanMod"
+
+    # curl и gpg нужны только для подключения репозитория — на минимальных
+    # облачных образах их может не быть по умолчанию
+    local need_pkgs=""
+    have curl || need_pkgs="curl"
+    have gpg  || need_pkgs="${need_pkgs:+$need_pkgs }gnupg"
+    if [ -n "$need_pkgs" ]; then
+        # shellcheck disable=SC2086
+        DEBIAN_FRONTEND=noninteractive apt-get install -y $need_pkgs >/dev/null \
+            || die "не поставились зависимости для подключения репозитория: $need_pkgs"
+    fi
+
+    mkdir -p "$(dirname "$KRN_KEYRING")"
+    local key_tmp; key_tmp="$(mktemp)"
+    if ! curl -fsSL "$KRN_KEY_URL" -o "$key_tmp"; then
+        rm -f "$key_tmp"
+        die "не скачался ключ репозитория: $KRN_KEY_URL"
+    fi
+    save_or_new "$KRN_KEYRING"
+    gpg --batch --yes --dearmor -o "$KRN_KEYRING" "$key_tmp"
+    rm -f "$key_tmp"
+    chmod 0644 "$KRN_KEYRING"
+    ok "ключ репозитория: $KRN_KEYRING"
+
+    save_or_new "$KRN_LIST_FILE"
+    {
+        printf '# %s %s\n' "$MARKER" "$VERSION"
+        printf 'deb [signed-by=%s] %s %s main\n' "$KRN_KEYRING" "$KRN_APT_URL" "$KRN_APT_SUITE"
+    } > "$KRN_LIST_FILE"
+    chmod 0644 "$KRN_LIST_FILE"
+    ok "репозиторий: $KRN_LIST_FILE"
+
+    apt-get update >/dev/null || die "apt-get update не прошёл после добавления репозитория XanMod"
+
+    # У XanMod один общий репозиторий на все Debian и Ubuntu, но какой именно
+    # suite он ждёт, проверить отсюда нельзя. Если пакета в «releases» нет,
+    # пробуем кодовое имя дистрибутива, а не падаем с невнятной ошибкой apt.
+    if ! apt-cache policy "$pkg" 2>/dev/null | grep -q 'Candidate: [^(]'; then
+        local codename=""
+        codename="$(. /etc/os-release 2>/dev/null && printf '%s' "${VERSION_CODENAME:-}")"
+        if [ -n "$codename" ] && [ "$codename" != "$KRN_APT_SUITE" ]; then
+            warn "в suite «$KRN_APT_SUITE» пакета $pkg нет, пробую «$codename»"
+            printf 'deb [signed-by=%s] %s %s main\n' "$KRN_KEYRING" "$KRN_APT_URL" "$codename" > "$KRN_APT_LIST"
+            apt-get update >/dev/null || true
+        fi
+    fi
+    apt-cache policy "$pkg" 2>/dev/null | grep -q 'Candidate: [^(]' \
+        || die "Репозиторий XanMod не отдаёт пакет $pkg.
+   Проверь https://xanmod.org — формат репозитория мог измениться."
+    ok "пакет $pkg доступен в репозитории"
+
+    local hold_pkgs; hold_pkgs="$(krn_current_kernel_pkgs)"
+    if [ -n "$hold_pkgs" ]; then
+        # shellcheck disable=SC2086
+        apt-mark hold $hold_pkgs >/dev/null
+        ok "закреплены пакеты текущего ядра (apt-mark hold):"
+        dim "  $(printf '%s' "$hold_pkgs" | tr '\n' ' ')"
+    else
+        warn "не нашёл пакет текущего ядра ($KRN_CURRENT) по имени — hold не поставлен"
+        dim  "  после установки проверь вручную: dpkg -l | grep $KRN_CURRENT"
+    fi
+
+    if ! dpkg -s "$pkg" >/dev/null 2>&1; then
+        if ! DEBIAN_FRONTEND=noninteractive apt-get install -y "$pkg" >/dev/null 2>&1; then
+            # свежий VPS часто отдаётся с пустым или просроченным кэшем индексов
+            apt-get update >/dev/null 2>&1 || true
+            DEBIAN_FRONTEND=noninteractive apt-get install -y "$pkg" >/dev/null \
+                || die "не удалось установить пакет $pkg"
+        fi
+        record pkg "$pkg"
+    fi
+    ok "пакет $pkg установлен"
+
+    if ! dpkg-query -W -f='${Status}' "$pkg" 2>/dev/null | grep -q '^install ok installed$'; then
+        die "пакет $pkg установлен не полностью (проверь: dpkg -s $pkg) — не продолжаю"
+    fi
+
+    local vmlinuz krelease initrd f
+    vmlinuz="$(dpkg-query -L "$pkg" 2>/dev/null | grep -E '^/boot/vmlinuz-' | head -n1)"
+    [ -n "$vmlinuz" ] || die "пакет $pkg установлен, но /boot/vmlinuz для него не нашёлся"
+    krelease="${vmlinuz#/boot/vmlinuz-}"
+    initrd="/boot/initrd.img-$krelease"
+    for f in "$vmlinuz" "$initrd"; do
+        [ -s "$f" ] || die "файл $f отсутствует или пустой — установка ядра не завершена"
+    done
+
+    local vmlinuz_mib initrd_mib
+    vmlinuz_mib=$(( $(stat -c%s "$vmlinuz" 2>/dev/null || echo 0) / 1048576 ))
+    initrd_mib=$(( $(stat -c%s "$initrd" 2>/dev/null || echo 0) / 1048576 ))
+    ok "$(basename "$vmlinuz")  ($(fmt_mib "$vmlinuz_mib"))"
+    ok "$(basename "$initrd")  ($(fmt_mib "$initrd_mib"))"
+
+    # postinst kernel-пакета обычно сам вызывает update-grub через
+    # /etc/kernel/postinst.d — перевызываем явно, чтобы не зависеть от того,
+    # доехал ли этот хук в стороннем репозитории
+    if have update-grub; then
+        update-grub >/dev/null || die "update-grub не прошёл"
+    elif have grub-mkconfig; then
+        grub-mkconfig -o /boot/grub/grub.cfg >/dev/null || die "grub-mkconfig не прошёл"
+    fi
+
+    grep -qF "$krelease" /boot/grub/grub.cfg \
+        || die "новое ядро не появилось в /boot/grub/grub.cfg"
+    grep -qF "$KRN_CURRENT" /boot/grub/grub.cfg \
+        || die "старое ядро $KRN_CURRENT пропало из /boot/grub/grub.cfg — без запасного варианта не продолжаю"
+    ok "новое ядро есть в grub.cfg, $KRN_CURRENT остался запасным пунктом"
+
+    say ""
+    hdr "Готово, но перезагрузку делает человек"
+    warn "скрипт НЕ перезагружает сервер автоматически и не будет этого делать"
+    warn "перед перезагрузкой убедись, что есть доступ к консоли провайдера (VNC/serial/KVM):"
+    dim  "известный класс отказа — ядро загружается, но сеть не поднимается"
+    dim  "если что-то пойдёт не так — на экране GRUB выбери прежнее ядро: $KRN_CURRENT"
+    say ""
+    return 0
+}
+
+# ══════════════════════════════════ status ══════════════════════════════════
+
+krn_status() {
+    local krelease bbr_ver cc
+    krelease="$(uname -r)"
+    bbr_ver="$(krn_bbr_module_version)"
+    cc="$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo '?')"
+
+    hdr "Ядро и BBR"
+    info "ядро                $krelease"
+    if [ -z "$bbr_ver" ]; then
+        warn "модуль tcp_bbr не загружен"
+    elif [ "$bbr_ver" = "3" ]; then
+        ok "версия tcp_bbr      $bbr_ver (это BBRv3)"
+    else
+        info "версия tcp_bbr      $bbr_ver (BBRv3 нет, для неё нужно ядро XanMod)"
+    fi
+    info "congestion control  $cc"
+    if [ "$cc" = "bbr" ] && [ "$bbr_ver" != "3" ]; then
+        dim "control «bbr» включён, но по имени не отличить v1/v2 от v3 — смотри версию модуля выше"
+    fi
+    return 0
+}
+
+cmd_kernel() {
+    require_root
+    detect_host
+    TG_MODE="server"
+    krn_detect
+    krn_render_plan
+    if ! krn_blockers; then
+        say ""
+        die "Установка ядра на этой машине небезопасна. Причины выше."
+    fi
+    say ""
+    warn "Это единственный модуль, который меняет то, чем сервер загружается."
+    dim  "Убедись, что у провайдера есть консоль (VNC, serial, rescue): известный"
+    dim  "отказ — ядро грузится, но пропадает сеть, и SSH уже не поможет."
+    confirm "Ставить ядро XanMod?" || { dim "Отменено."; say ""; return 0; }
+    backup_init
+    trap on_error ERR
+    APPLY_STARTED=1
+    krn_apply
+    trap - ERR
+    APPLY_STARTED=0
+    return 0
+}
+
 # ═════════════════════ сетевой тюнинг и гигиена VPS ═════════════════════════
 # shellcheck shell=bash
 #
@@ -2873,8 +3299,10 @@ cmd_menu() {
     printf '  %s4%s) SSH         защита входа и fail2ban. Отключать пароли откажется,\n' "$CW" "$CN"
     printf '                  %sпока не увидит другого способа войти.%s\n' "$CD" "$CN"
     printf '  %s5%s) Сеть        буферы, очереди, conntrack, автообновления, журнал.\n' "$CW" "$CN"
-    printf '  %s6%s) Посмотреть  подробный отчёт, ничего не менять.\n' "$CW" "$CN"
-    printf '  %s7%s) Откатить    вернуть то, что сделал прошлый запуск.\n' "$CW" "$CN"
+    printf '  %s6%s) Ядро        XanMod ради BBRv3. Требует перезагрузки и консоли\n' "$CW" "$CN"
+    printf '                  %sу провайдера — самый рискованный пункт.%s\n' "$CD" "$CN"
+    printf '  %s7%s) Посмотреть  подробный отчёт, ничего не менять.\n' "$CW" "$CN"
+    printf '  %s8%s) Откатить    вернуть то, что сделал прошлый запуск.\n' "$CW" "$CN"
     printf '  %s0%s) Выход
 ' "$CW" "$CN"
     printf '
@@ -2889,10 +3317,11 @@ cmd_menu() {
         3) CMD="firewall"; cmd_firewall ;;
         4) CMD="ssh";      cmd_ssh ;;
         5) CMD="hygiene";  cmd_hygiene ;;
-        6) CMD="status";   cmd_status ;;
-        7) CMD="rollback"; cmd_rollback ;;
+        6) CMD="kernel";   cmd_kernel ;;
+        7) CMD="status";   cmd_status ;;
+        8) CMD="rollback"; cmd_rollback ;;
         0|"") dim "Выход."; say "" ;;
-        *) die "Не понял «$choice». Ожидались 0-7." ;;
+        *) die "Не понял «$choice». Ожидались 0-8." ;;
     esac
     return 0
 }
@@ -2987,6 +3416,7 @@ parse_args() {
             firewall|fw)    [ -z "$CMD" ] && CMD="firewall" ;;
             ssh|sshd)       [ -z "$CMD" ] && CMD="ssh" ;;
             tune|hygiene)   [ -z "$CMD" ] && CMD="hygiene" ;;
+            kernel|xanmod)  [ -z "$CMD" ] && CMD="kernel" ;;
             confirm)        FW_CONFIRM=1 ;;
             --allow-tcp)    [ $# -ge 2 ] || die "Опция --allow-tcp требует значение."; FW_ALLOW_TCP="$2"; shift ;;
             --allow-tcp=*)  FW_ALLOW_TCP="${1#*=}" ;;
@@ -3093,6 +3523,7 @@ main() {
         firewall) if [ "$FW_CONFIRM" = "1" ]; then cmd_fw_confirm; else cmd_firewall; fi ;;
         ssh)      cmd_ssh ;;
         hygiene)  cmd_hygiene ;;
+        kernel)   cmd_kernel ;;
         menu)     cmd_menu ;;
         status)   cmd_status ;;
         plan)     cmd_plan ;;
