@@ -240,6 +240,9 @@ detect_host() {
     HOST_ROOTFS="$(findmnt -no FSTYPE / 2>/dev/null || echo unknown)"
     HOST_DISK_FREE_MIB="$(df -Pm / 2>/dev/null | awk 'NR==2{print $4}')"
     [ -z "$HOST_DISK_FREE_MIB" ] && HOST_DISK_FREE_MIB=0
+    # Без этого return функция вернёт код теста выше: диск непустой -> 1 -> set -e
+    # убивает скрипт молча. На bash 3.2 не воспроизводится, на 5.1 воспроизводится.
+    return 0
 }
 
 # Единственная формула лимита: оставить системе разумный запас, остальное — ноде.
